@@ -545,8 +545,21 @@ async function refreshActiveContext() {
   const newDomain = activeTab?.url ? normalizeDomain(activeTab.url) : null;
   const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
 
-  // If the domain has changed, close out the old session and start fresh
-  if (activeSession?.domain && newDomain !== activeSession.domain) {
+  if (!newDomain && activeSession?.domain) {
+    await updateBadge();
+    await syncTodayToBackend();
+    return;
+  }
+
+  console.log("NEW DOMAIN:", newDomain);
+  console.log("OLD DOMAIN:", activeSession?.domain);
+
+  // Only reset if we actually have a valid new domain AND it changed
+  if (
+    activeSession?.domain &&
+    newDomain &&
+    newDomain !== activeSession.domain
+  ) {
     await saveCompletedSession(activeSession, timestamp);
     await chrome.storage.local.remove("activeSession");
   }
