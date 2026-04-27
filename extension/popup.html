@@ -26,43 +26,55 @@
 
       <!-- Active domain session card -->
       <section class="active-card" aria-label="Current session">
-        <div class="active-card-label">
-          <span class="dot"></span>
-          Active session
+        <button
+          id="activeSessionToggle"
+          class="active-card-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="activeSessionPanel"
+        >
+          <span class="active-card-title">
+            <span class="dot"></span>
+            Active session
+          </span>
+          <span id="sessionToggleSummary" class="session-toggle-summary">No active tab</span>
+          <span class="chevron" aria-hidden="true"></span>
+        </button>
+
+        <div id="activeSessionPanel" class="active-card-body" hidden>
+          <dl class="session-row">
+            <div class="session-stat">
+              <dt>This session</dt>
+              <dd id="currentSession">0<small>min</small></dd>
+            </div>
+            <div class="session-stat">
+              <dt>Typical</dt>
+              <dd id="typicalSession">0<small>min</small></dd>
+            </div>
+          </dl>
+
+          <dl class="session-meta">
+            <div class="meta-pill">
+              <dt>Status</dt>
+              <dd id="sessionStatus">No active tab</dd>
+            </div>
+            <div class="meta-pill">
+              <dt>vs past</dt>
+              <dd id="sessionPercentile">-</dd>
+            </div>
+            <div class="meta-pill" style="grid-column: 1 / -1;">
+              <dt>Confidence</dt>
+              <dd id="sessionConfidence">-</dd>
+            </div>
+          </dl>
+
+          <p id="sessionRecommendation" class="session-rec" hidden></p>
         </div>
-
-        <dl class="session-row">
-          <div class="session-stat">
-            <dt>This session</dt>
-            <dd id="currentSession">0<small>min</small></dd>
-          </div>
-          <div class="session-stat">
-            <dt>Typical</dt>
-            <dd id="typicalSession">0<small>min</small></dd>
-          </div>
-        </dl>
-
-        <dl class="session-meta">
-          <div class="meta-pill">
-            <dt>Status</dt>
-            <dd id="sessionStatus">No active tab</dd>
-          </div>
-          <div class="meta-pill">
-            <dt>vs past</dt>
-            <dd id="sessionPercentile">-</dd>
-          </div>
-          <div class="meta-pill" style="grid-column: 1 / -1;">
-            <dt>Confidence</dt>
-            <dd id="sessionConfidence">-</dd>
-          </div>
-        </dl>
-
-        <p id="sessionRecommendation" class="session-rec" hidden></p>
       </section>
 
       <!-- Daily totals card -->
       <section class="daily-card" aria-label="Daily summary">
-        <p class="daily-card-title">Today's usage</p>
+        <p id="dailyCardTitle" class="daily-card-title">Today's usage</p>
 
         <dl class="daily-stats">
           <div class="daily-stat">
@@ -70,7 +82,7 @@
             <dd id="today">0<small>min</small></dd>
           </div>
           <div class="daily-stat">
-            <dt>Avg (same day)</dt>
+            <dt>Average</dt>
             <dd id="average">0<small>min</small></dd>
           </div>
         </dl>
@@ -84,10 +96,84 @@
         <p id="recommendation" class="daily-rec" hidden></p>
       </section>
 
+      <!-- Insight layer -->
+      <section class="insights-card" aria-labelledby="insightsTitle">
+        <p class="section-title" id="insightsTitle">Insights</p>
+        <ul id="insightsList" class="insights-list"></ul>
+      </section>
+
+      <!-- Manual controls -->
+      <section class="controls-card" aria-labelledby="controlsTitle">
+        <p class="section-title" id="controlsTitle">Controls</p>
+
+        <div class="category-control">
+          <label for="categorySelect">Current site</label>
+          <select id="categorySelect" aria-label="Current site category">
+            <option value="productive">Productive</option>
+            <option value="distracting">Distracting</option>
+            <option value="neutral">Neutral</option>
+          </select>
+        </div>
+
+        <div class="control-grid">
+          <button id="pauseTracking" type="button">Pause</button>
+          <button id="resumeTracking" type="button">Resume</button>
+          <button id="excludeCurrentSite" type="button">Exclude site</button>
+          <button id="resetToday" type="button">Reset today</button>
+          <button id="clearAllData" class="danger-button" type="button">Clear all data</button>
+        </div>
+      </section>
+
+      <!-- Weekly trends -->
+      <section class="trends-card" aria-labelledby="trendsTitle">
+        <p class="section-title" id="trendsTitle">Weekly trends</p>
+
+        <div id="dailyChart" class="daily-chart"></div>
+
+        <div class="trend-stats">
+          <div>
+            <span>Productive</span>
+            <strong id="productiveRatio">0%</strong>
+          </div>
+          <div>
+            <span>Distracting</span>
+            <strong id="distractingRatio">0%</strong>
+          </div>
+          <div>
+            <span>Avg session</span>
+            <strong id="averageSessionLength">0 min</strong>
+          </div>
+          <div>
+            <span>Switches</span>
+            <strong id="weeklySwitches">0</strong>
+          </div>
+        </div>
+
+        <div>
+          <p class="mini-title">Top sites</p>
+          <div id="weeklyTopSites" class="weekly-sites"></div>
+        </div>
+      </section>
+
       <!-- Site leaderboard -->
       <section class="leaderboard" aria-labelledby="leaderboardTitle">
         <p class="leaderboard-title" id="leaderboardTitle">Today by site</p>
         <div id="siteLeaderboard" class="site-list"></div>
+      </section>
+
+      <!-- Debug panel -->
+      <section class="debug-card" aria-label="Debug panel">
+        <button
+          id="debugToggle"
+          class="debug-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="debugPanel"
+        >
+          Debug
+          <span class="debug-chevron" aria-hidden="true"></span>
+        </button>
+        <dl id="debugPanel" class="debug-panel" hidden></dl>
       </section>
 
     </main>

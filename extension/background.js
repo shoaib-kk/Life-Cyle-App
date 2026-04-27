@@ -10,6 +10,23 @@ const MIN_SESSION_HISTORY = 2;
 const MIN_TRACKED_DAY_MINUTES_FOR_PREDICTION = 30;
 const MIN_DOMAIN_MINUTES_FOR_PREDICTION = 10;
 const DAILY_HISTORY_RETENTION_DAYS = 70;
+const SESSION_GAP_THRESHOLD_MS = 5 * 60 * 1000;
+const SESSION_END_REASONS = new Set([
+  "tab_change",
+  "idle",
+  "window_blur",
+  "manual_pause"
+]);
+const DEFAULT_DOMAIN_CATEGORIES = {
+  "chatgpt.com": "productive",
+  "github.com": "productive",
+  "docs.google.com": "productive",
+  "youtube.com": "distracting",
+  "reddit.com": "distracting",
+  "instagram.com": "distracting",
+  "gmail.com": "neutral"
+};
+const CATEGORY_KEYS = ["productive", "distracting", "neutral"];
 
 let operationQueue = Promise.resolve();
 
@@ -29,6 +46,47 @@ async function getSettings() {
 
 async function setSettings(settings) {
   await chrome.storage.local.set({ settings });
+}
+
+function normalizeStoredList(value) {
+  return Array.isArray(value) ? value.filter(Boolean) : [];
+}
+
+async function getAppState() {
+  const {
+    activeSession = null,
+    trackingPaused = false,
+    excludedDomains = [],
+    domainCategories = {}
+  } = await chrome.storage.local.get({
+    activeSession: null,
+    trackingPaused: false,
+    excludedDomains: [],
+    domainCategories: {}
+  });
+
+  return {
+    activeSession,
+    trackingPaused: Boolean(trackingPaused),
+    excludedDomains: normalizeStoredList(excludedDomains),
+    domainCategories: domainCategories && typeof domainCategories === "object" ? domainCategories : {}
+  };
+}
+
+function normalizeCategory(category) {
+  return CATEGORY_KEYS.includes(category) ? category : "neutral";
+}
+
+function categoryForDomain(domain, domainCategories = {}) {
+  if (!domain) {
+    return "neutral";
+  }
+
+  return normalizeCategory(domainCategories[domain] || DEFAULT_DOMAIN_CATEGORIES[domain]);
+}
+
+function isExcludedDomain(domain, excludedDomains = []) {
+  return Boolean(domain && excludedDomains.includes(domain));
 }
 
 function lifecycleDate(timestamp = Date.now(), resetHour = 0) {
@@ -106,6 +164,15 @@ function normalizeDomain(url) {
     hostname = hostname.slice(4);
   }
 
+  const productHosts = new Map([
+    ["docs.google.com", "docs.google.com"],
+    ["mail.google.com", "gmail.com"]
+  ]);
+
+  if (productHosts.has(hostname)) {
+    return productHosts.get(hostname);
+  }
+
   const parts = hostname.split(".").filter(Boolean);
   if (parts.length <= 2) {
     return hostname;
@@ -150,6 +217,50 @@ function displayDomain(domain) {
 
 function toIsoString(timestamp) {
   return new Date(timestamp).toISOString();
+}
+
+function dateFromDateKey(dateKey, resetHour = 0) {
+  const [year, month, day] = String(dateKey).split("-").map(Number);
+  return new Date(year, month - 1, day, resetHour, 0, 0, 0);
+}
+
+function recentDateKeys(dateKey, count, resetHour = 0) {
+  const endDate = dateFromDateKey(dateKey, resetHour);
+  const keys = [];
+
+  for (let index = count - 1; index >= 0; index -= 1) {
+    const date = new Date(endDate);
+    date.setDate(endDate.getDate() - index);
+    keys.push(localDateKey(date.getTime(), resetHour));
+  }
+
+  return keys;
+}
+
+function sessionStartedAt(session) {
+  const value = session?.startedAt || session?.startTime;
+  const timestamp = value ? Date.parse(value) : NaN;
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function sessionEndedAt(session) {
+  const value = session?.endedAt || session?.endTime;
+  const timestamp = value ? Date.parse(value) : NaN;
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function sessionDateKey(session, resetHour = 0) {
+  const endedAt = sessionEndedAt(session) || sessionStartedAt(session);
+  return endedAt ? localDateKey(endedAt, resetHour) : null;
+}
+
+function sessionLastSeenAt(session) {
+  return session?.lastSeenAt || session?.lastCheckpointAt || session?.startedAt || null;
+}
+
+function sessionGapElapsed(session, timestamp) {
+  const lastSeenAt = sessionLastSeenAt(session);
+  return !lastSeenAt || timestamp - lastSeenAt >= SESSION_GAP_THRESHOLD_MS;
 }
 
 function predictionForDay(currentUsage, elapsedMinutesToday) {
@@ -357,7 +468,7 @@ async function getSessions() {
   return Array.isArray(sessions) ? sessions : [];
 }
 
-async function saveCompletedSession(activeSession, endedAt) {
+async function saveCompletedSession(activeSession, endedAt, reasonEnded = "tab_change") {
   const startedAt = activeSession.startedAt || activeSession.lastCheckpointAt;
 
   if (!activeSession.domain || !startedAt || endedAt <= startedAt) {
@@ -371,16 +482,34 @@ async function saveCompletedSession(activeSession, endedAt) {
   }
 
   const sessions = await getSessions();
+  const safeReason = SESSION_END_REASONS.has(reasonEnded) ? reasonEnded : "tab_change";
   sessions.push({
     domain: activeSession.domain,
-    startTime: toIsoString(startedAt),
-    endTime: toIsoString(endedAt),
-    durationMinutes
+    startedAt: toIsoString(startedAt),
+    endedAt: toIsoString(endedAt),
+    durationMinutes,
+    reasonEnded: safeReason
   });
 
   await chrome.storage.local.set({
     sessions: sessions.slice(-SESSION_HISTORY_LIMIT)
   });
+}
+
+async function saveCompletedSessionIfGapElapsed(activeSession, timestamp, reasonEnded = "tab_change") {
+  if (!activeSession?.domain || !sessionGapElapsed(activeSession, timestamp)) {
+    return false;
+  }
+
+  const endedAt = sessionLastSeenAt(activeSession) || timestamp;
+  const checkpointAt = activeSession.lastCheckpointAt || activeSession.startedAt || endedAt;
+
+  if (endedAt > checkpointAt) {
+    await addUsageMinutes(activeSession.domain, checkpointAt, endedAt);
+  }
+
+  await saveCompletedSession(activeSession, endedAt, reasonEnded);
+  return true;
 }
 
 async function addUsageMinutes(domain, startedAt, endedAt) {
@@ -419,7 +548,14 @@ async function checkpointActiveSession(timestamp = Date.now(), options = {}) {
   }
 
   const checkpointAt = activeSession.lastCheckpointAt || activeSession.startedAt;
-  const endedAt = Math.max(checkpointAt, timestamp - (options.subtractIdleSeconds || 0) * 1000);
+  const rawEndedAt = Math.max(checkpointAt, timestamp - (options.subtractIdleSeconds || 0) * 1000);
+  const shouldCapAtLastSeen =
+    Boolean(activeSession.awaySince) &&
+    options.currentDomain !== undefined &&
+    options.currentDomain !== activeSession.domain;
+  const endedAt = shouldCapAtLastSeen
+    ? Math.min(rawEndedAt, sessionLastSeenAt(activeSession) || rawEndedAt)
+    : rawEndedAt;
 
   if (!checkpointAt || endedAt <= checkpointAt) {
     return;
@@ -430,29 +566,37 @@ async function checkpointActiveSession(timestamp = Date.now(), options = {}) {
     activeSession: {
       ...activeSession,
       lastCheckpointAt: endedAt,
+      lastSeenAt: shouldCapAtLastSeen ? sessionLastSeenAt(activeSession) : endedAt,
       date: localDateKey(endedAt, (await getSettings()).dailyResetHour)
     }
   });
 }
 
-async function getFocusedActiveTab() {
-  // First check if there's actually a focused Chrome window
+async function getFocusSnapshot() {
   const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
-  const focusedWindow = windows.find((w) => w.focused);
+  const focusedWindow = windows.find((w) => w.focused) || null;
+  let activeTab = null;
 
-  if (!focusedWindow) {
-    return null;
+  if (focusedWindow) {
+    const [tab] = await chrome.tabs.query({
+      active: true,
+      windowId: focusedWindow.id
+    });
+    activeTab = tab || null;
   }
 
-  const [tab] = await chrome.tabs.query({
-    active: true,
-    windowId: focusedWindow.id
-  });
-
-  return tab || null;
+  return {
+    focusedWindow,
+    activeTab,
+    currentDomain: activeTab?.url ? normalizeDomain(activeTab.url) : null
+  };
 }
 
-async function pauseTrackingForIdle(timestamp = Date.now(), subtractIdleSeconds = 0) {
+async function getFocusedActiveTab() {
+  return (await getFocusSnapshot()).activeTab;
+}
+
+async function pauseTrackingForIdle(timestamp = Date.now(), subtractIdleSeconds = 0, reasonEnded = "idle") {
   const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
 
   if (!activeSession?.domain) {
@@ -460,14 +604,28 @@ async function pauseTrackingForIdle(timestamp = Date.now(), subtractIdleSeconds 
   }
 
   const checkpointAt = activeSession.lastCheckpointAt || activeSession.startedAt || timestamp;
-  const endedAt = Math.max(checkpointAt, timestamp - subtractIdleSeconds * 1000);
+  const existingLastSeenAt = sessionLastSeenAt(activeSession);
+  const endedAt = activeSession.awaySince
+    ? existingLastSeenAt
+    : Math.max(checkpointAt, timestamp - subtractIdleSeconds * 1000);
 
   if (endedAt > checkpointAt) {
     await addUsageMinutes(activeSession.domain, checkpointAt, endedAt);
   }
 
-  await saveCompletedSession(activeSession, endedAt);
-  await chrome.storage.local.remove("activeSession");
+  const pausedSession = {
+    ...activeSession,
+    lastCheckpointAt: endedAt,
+    lastSeenAt: endedAt,
+    awaySince: activeSession.awaySince || endedAt
+  };
+
+  if (await saveCompletedSessionIfGapElapsed(pausedSession, timestamp, reasonEnded)) {
+    await chrome.storage.local.remove("activeSession");
+    return;
+  }
+
+  await chrome.storage.local.set({ activeSession: pausedSession });
 }
 
 async function resumeTrackingIfActive() {
@@ -481,25 +639,56 @@ async function resumeTrackingIfActive() {
 async function startSessionForTab(tab, timestamp = Date.now()) {
   const domain = tab?.url ? normalizeDomain(tab.url) : null;
   console.log("Starting session for:", domain);
-  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+  const { activeSession, trackingPaused, excludedDomains } = await getAppState();
   const settings = await getSettings();
 
   if (!domain) {
-    if (activeSession?.domain) {
-      await saveCompletedSession(activeSession, timestamp);
+    return;
+  }
+
+  if (trackingPaused || isExcludedDomain(domain, excludedDomains)) {
+    if (
+      activeSession?.domain &&
+      await saveCompletedSessionIfGapElapsed(activeSession, timestamp, "manual_pause")
+    ) {
+      await chrome.storage.local.remove("activeSession");
     }
 
-    await chrome.storage.local.remove("activeSession");
     return;
   }
 
   if (activeSession?.domain === domain) {
-    // Already tracking this domain — only update window/tab refs, keep timing intact
+    if (activeSession.awaySince && sessionGapElapsed(activeSession, timestamp)) {
+      await saveCompletedSessionIfGapElapsed(activeSession, timestamp, "tab_change");
+      await chrome.storage.local.set({
+        activeSession: {
+          domain,
+          tabId: tab.id,
+          windowId: tab.windowId,
+          startedAt: timestamp,
+          lastCheckpointAt: timestamp,
+          lastSeenAt: timestamp,
+          date: localDateKey(timestamp, settings.dailyResetHour)
+        }
+      });
+      return;
+    }
+
+    const {
+      awaySince: _awaySince,
+      pendingDomain: _pendingDomain,
+      pendingStartedAt: _pendingStartedAt,
+      pendingTabId: _pendingTabId,
+      pendingWindowId: _pendingWindowId,
+      ...resumedSession
+    } = activeSession;
+
     await chrome.storage.local.set({
       activeSession: {
-        ...activeSession,
+        ...resumedSession,
         tabId: tab.id,
         windowId: tab.windowId,
+        lastSeenAt: timestamp,
         date: localDateKey(timestamp, settings.dailyResetHour)
       }
     });
@@ -507,16 +696,38 @@ async function startSessionForTab(tab, timestamp = Date.now()) {
   }
 
   if (activeSession?.domain) {
-    await saveCompletedSession(activeSession, timestamp);
+    if (!sessionGapElapsed(activeSession, timestamp)) {
+      await chrome.storage.local.set({
+        activeSession: {
+          ...activeSession,
+          pendingDomain: domain,
+          pendingStartedAt:
+            activeSession.pendingDomain === domain
+              ? activeSession.pendingStartedAt
+              : timestamp,
+          pendingTabId: tab.id,
+          pendingWindowId: tab.windowId
+        }
+      });
+      return;
+    }
+
+    await saveCompletedSessionIfGapElapsed(activeSession, timestamp, "tab_change");
   }
+
+  const startedAt =
+    activeSession?.pendingDomain === domain && activeSession.pendingStartedAt
+      ? activeSession.pendingStartedAt
+      : timestamp;
 
   await chrome.storage.local.set({
     activeSession: {
       domain,
       tabId: tab.id,
       windowId: tab.windowId,
-      startedAt: timestamp,
-      lastCheckpointAt: timestamp,
+      startedAt,
+      lastCheckpointAt: startedAt,
+      lastSeenAt: timestamp,
       date: localDateKey(timestamp, settings.dailyResetHour)
     }
   });
@@ -530,22 +741,43 @@ async function getCurrentTrackedDomain() {
 async function refreshActiveContext() {
   const timestamp = Date.now();
   const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
+  const { trackingPaused, excludedDomains } = await getAppState();
+  const { focusedWindow, activeTab, currentDomain: newDomain } = await getFocusSnapshot();
 
-  if (idleState !== "active") {
-    await pauseTrackingForIdle(timestamp, IDLE_DETECTION_SECONDS);
+  if (trackingPaused) {
     await updateBadge();
     return;
   }
 
-  // Checkpoint first so any elapsed time on the current session is saved
-  await checkpointActiveSession(timestamp);
+  if (idleState !== "active") {
+    await pauseTrackingForIdle(timestamp, IDLE_DETECTION_SECONDS, "idle");
+    await updateBadge();
+    return;
+  }
 
-  const activeTab = await getFocusedActiveTab();
   console.log("Active tab:", activeTab?.url);
-  const newDomain = activeTab?.url ? normalizeDomain(activeTab.url) : null;
-  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+  await checkpointActiveSession(timestamp, { currentDomain: newDomain });
+  let { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+
+  if (!focusedWindow && activeSession?.domain) {
+    await pauseTrackingForIdle(timestamp, 0, "window_blur");
+    await updateBadge();
+    await syncTodayToBackend();
+    return;
+  }
 
   if (!newDomain && activeSession?.domain) {
+    await pauseTrackingForIdle(timestamp, 0, "tab_change");
+    await updateBadge();
+    await syncTodayToBackend();
+    return;
+  }
+
+  if (isExcludedDomain(newDomain, excludedDomains)) {
+    if (activeSession?.domain) {
+      await pauseTrackingForIdle(timestamp, 0, "manual_pause");
+    }
+
     await updateBadge();
     await syncTodayToBackend();
     return;
@@ -560,8 +792,23 @@ async function refreshActiveContext() {
     newDomain &&
     newDomain !== activeSession.domain
   ) {
-    await saveCompletedSession(activeSession, timestamp);
-    await chrome.storage.local.remove("activeSession");
+    const pendingStartedAt =
+      activeSession.pendingDomain === newDomain
+        ? activeSession.pendingStartedAt
+        : timestamp;
+
+    await chrome.storage.local.set({
+      activeSession: {
+        ...activeSession,
+        lastSeenAt: activeSession.awaySince ? activeSession.lastSeenAt : timestamp,
+        lastCheckpointAt: activeSession.awaySince ? activeSession.lastCheckpointAt : timestamp,
+        awaySince: activeSession.awaySince || timestamp,
+        pendingDomain: newDomain,
+        pendingStartedAt,
+        pendingTabId: activeTab?.id,
+        pendingWindowId: activeTab?.windowId
+      }
+    });
   }
 
   await startSessionForTab(activeTab, timestamp);
@@ -598,8 +845,32 @@ function baselineForDomain(
 }
 
 async function buildCurrentSessionInsight(domain, timestamp = Date.now()) {
-  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+  const { activeSession, trackingPaused, excludedDomains } = await getAppState();
   const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
+
+  if (trackingPaused) {
+    return {
+      currentSessionMinutes: "-",
+      typicalSessionMinutes: "-",
+      sessionStatus: "Paused",
+      sessionConfidence: "-",
+      sessionPercentile: null,
+      sessionPercentileText: "-",
+      sessionRecommendation: ""
+    };
+  }
+
+  if (isExcludedDomain(domain, excludedDomains)) {
+    return {
+      currentSessionMinutes: "-",
+      typicalSessionMinutes: "-",
+      sessionStatus: "Excluded",
+      sessionConfidence: "-",
+      sessionPercentile: null,
+      sessionPercentileText: "-",
+      sessionRecommendation: ""
+    };
+  }
 
   // Match against activeSession.domain directly; domain param is the resolved current domain
   const sessionDomain = activeSession?.domain || null;
@@ -617,9 +888,12 @@ async function buildCurrentSessionInsight(domain, timestamp = Date.now()) {
     };
   }
 
-  // Use lastCheckpointAt as the session start for display so idle gaps don't inflate the timer
-  const sessionStart = activeSession.lastCheckpointAt || activeSession.startedAt || timestamp;
-  const currentSessionMinutes = Math.max(0, (timestamp - sessionStart) / 60000);
+  // Use startedAt so checkpoints do not reset the visible session duration
+  const sessionStart = activeSession.startedAt || activeSession.lastCheckpointAt || timestamp;
+  const visibleEndedAt = activeSession.awaySince
+    ? sessionLastSeenAt(activeSession) || timestamp
+    : timestamp;
+  const currentSessionMinutes = Math.max(0, (visibleEndedAt - sessionStart) / 60000);
   const sessions = await getSessions();
   const previousDurations = sessions
     .filter((session) => session.domain === domain)
@@ -655,15 +929,231 @@ async function buildCurrentSessionInsight(domain, timestamp = Date.now()) {
   };
 }
 
+function categoryTotalsForUsage(usage = {}, domainCategories = {}) {
+  const totals = {
+    productive: 0,
+    distracting: 0,
+    neutral: 0,
+    total: 0
+  };
+
+  for (const [domain, minutes] of Object.entries(usage)) {
+    const value = Number(minutes || 0);
+    const category = categoryForDomain(domain, domainCategories);
+    totals[category] += value;
+    totals.total += value;
+  }
+
+  return {
+    productive: displayMinutes(totals.productive),
+    distracting: displayMinutes(totals.distracting),
+    neutral: displayMinutes(totals.neutral),
+    total: displayMinutes(totals.total),
+    productiveRatio:
+      totals.total > 0 ? Math.round((totals.productive / totals.total) * 100) : 0,
+    distractingRatio:
+      totals.total > 0 ? Math.round((totals.distracting / totals.total) * 100) : 0
+  };
+}
+
+function aggregateUsageForDates(dailyUsage, dateKeys) {
+  const aggregate = {};
+
+  for (const dateKey of dateKeys) {
+    for (const [domain, minutes] of Object.entries(dailyUsage[dateKey] || {})) {
+      aggregate[domain] = roundMinutes((aggregate[domain] || 0) + Number(minutes || 0));
+    }
+  }
+
+  return aggregate;
+}
+
+function topUsageEntries(usage = {}, limit = 3) {
+  return Object.entries(usage)
+    .map(([domain, minutes]) => ({ domain, minutes: displayMinutes(minutes) }))
+    .filter((entry) => entry.minutes > 0)
+    .sort((left, right) => right.minutes - left.minutes)
+    .slice(0, limit);
+}
+
+function topDomainForCategory(usage = {}, domainCategories = {}, category) {
+  return Object.entries(usage)
+    .map(([domain, minutes]) => ({
+      domain,
+      minutes: Number(minutes || 0),
+      category: categoryForDomain(domain, domainCategories)
+    }))
+    .filter((entry) => entry.category === category && entry.minutes > 0)
+    .sort((left, right) => right.minutes - left.minutes)[0] || null;
+}
+
+function sessionsForDate(sessions, dateKey, resetHour = 0) {
+  return sessions.filter((session) => sessionDateKey(session, resetHour) === dateKey);
+}
+
+function sessionsForDates(sessions, dateKeys, resetHour = 0) {
+  const keySet = new Set(dateKeys);
+  return sessions.filter((session) => keySet.has(sessionDateKey(session, resetHour)));
+}
+
+function contextSwitchCount(sessions) {
+  return sessions.filter((session) => session.reasonEnded === "tab_change").length;
+}
+
+function bestFocusBlock(sessions, activeSession, domainCategories, dateKey, resetHour, timestamp) {
+  const todaySessions = sessionsForDate(sessions, dateKey, resetHour)
+    .map((session) => ({
+      domain: session.domain,
+      durationMinutes: Number(session.durationMinutes || 0)
+    }));
+
+  if (
+    activeSession?.domain &&
+    categoryForDomain(activeSession.domain, domainCategories) === "productive"
+  ) {
+    const sessionStart = activeSession.startedAt || activeSession.lastCheckpointAt || timestamp;
+    todaySessions.push({
+      domain: activeSession.domain,
+      durationMinutes: Math.max(0, (timestamp - sessionStart) / 60000)
+    });
+  }
+
+  return todaySessions
+    .filter((session) => categoryForDomain(session.domain, domainCategories) === "productive")
+    .sort((left, right) => right.durationMinutes - left.durationMinutes)[0] || null;
+}
+
+function buildInsightList({
+  domain,
+  today,
+  baseline,
+  baselineRecordCount,
+  currentSessionMinutes,
+  typicalSessionMinutes,
+  usageToday,
+  sessions,
+  activeSession,
+  domainCategories,
+  dateKey,
+  resetHour,
+  timestamp
+}) {
+  const insights = [];
+
+  if (domain && baselineRecordCount >= MIN_BASELINE_RECORDS && baseline > 0) {
+    const delta = (today - baseline) / baseline;
+
+    if (delta >= 0.1) {
+      insights.push(
+        `You've spent ${Math.round(delta * 100)}% more time on ${domain} than usual today`
+      );
+    }
+  }
+
+  if (
+    domain &&
+    typeof currentSessionMinutes === "number" &&
+    typeof typicalSessionMinutes === "number" &&
+    typicalSessionMinutes > 0 &&
+    currentSessionMinutes > typicalSessionMinutes
+  ) {
+    insights.push(
+      `This ${displayDomain(domain)} session is longer than your median ${displayDomain(domain)} session`
+    );
+  }
+
+  const distractingSite = topDomainForCategory(usageToday, domainCategories, "distracting");
+  if (distractingSite) {
+    insights.push(
+      `Most distracting site today: ${distractingSite.domain} (${displayMinutes(distractingSite.minutes)} min)`
+    );
+  }
+
+  const focusBlock = bestFocusBlock(
+    sessions,
+    activeSession,
+    domainCategories,
+    dateKey,
+    resetHour,
+    timestamp
+  );
+  if (focusBlock && focusBlock.durationMinutes > 0) {
+    insights.push(
+      `Best focus block today: ${displayDomain(focusBlock.domain)} for ${displayMinutes(focusBlock.durationMinutes)} min`
+    );
+  }
+
+  const switchesToday = contextSwitchCount(sessionsForDate(sessions, dateKey, resetHour));
+  insights.push(`Context switches today: ${switchesToday}`);
+
+  return insights.length > 0 ? insights.slice(0, 5) : ["Keep browsing to build insights"];
+}
+
+function buildWeeklyTrends(dailyUsage, sessions, dateKey, resetHour, domainCategories) {
+  const dateKeys = recentDateKeys(dateKey, 7, resetHour);
+  const dailyTotals = dateKeys.map((key) => ({
+    date: key,
+    minutes: displayMinutes(totalMinutesForDate(dailyUsage, key))
+  }));
+  const maxDailyMinutes = Math.max(...dailyTotals.map((day) => day.minutes), 1);
+  const weeklyUsage = aggregateUsageForDates(dailyUsage, dateKeys);
+  const categoryTotals = categoryTotalsForUsage(weeklyUsage, domainCategories);
+  const weekSessions = sessionsForDates(sessions, dateKeys, resetHour);
+  const totalSessionMinutes = weekSessions.reduce(
+    (sum, session) => sum + Number(session.durationMinutes || 0),
+    0
+  );
+
+  return {
+    dailyTotals: dailyTotals.map((day) => ({
+      ...day,
+      barPercent: Math.round((day.minutes / maxDailyMinutes) * 100)
+    })),
+    categoryTotals,
+    topSites: topUsageEntries(weeklyUsage, 3),
+    averageSessionLength:
+      weekSessions.length > 0 ? displayMinutes(totalSessionMinutes / weekSessions.length) : 0,
+    contextSwitchCount: contextSwitchCount(weekSessions)
+  };
+}
+
+function serializeDebugDate(value) {
+  return value ? toIsoString(value) : "-";
+}
+
+async function buildDebugInfo(snapshot, activeSession, currentDomain) {
+  const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
+
+  return {
+    currentDomain: currentDomain || "-",
+    activeSessionDomain: activeSession?.domain || "-",
+    startedAt: serializeDebugDate(activeSession?.startedAt),
+    lastCheckpointAt: serializeDebugDate(activeSession?.lastCheckpointAt),
+    idleState,
+    focusedWindow: snapshot.focusedWindow
+      ? `id ${snapshot.focusedWindow.id}, focused ${Boolean(snapshot.focusedWindow.focused)}`
+      : "-",
+    activeTabUrl: snapshot.activeTab?.url || "-"
+  };
+}
+
 async function buildSummary() {
   const now = Date.now();
   const settings = await getSettings();
   const dateKey = localDateKey(now, settings.dailyResetHour);
   const { dailyUsage, trackedDays } = await getDailyUsage();
-  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
-  const currentDomain = await getCurrentTrackedDomain();
+  const sessions = await getSessions();
+  const {
+    activeSession,
+    trackingPaused,
+    excludedDomains,
+    domainCategories
+  } = await getAppState();
+  const focusSnapshot = await getFocusSnapshot();
+  const currentDomain = focusSnapshot.currentDomain;
   // Prefer the actively-tracked domain; fall back to what's in the tab right now
   const domain = activeSession?.domain || currentDomain || null;
+  const usageToday = dailyUsage[dateKey] || {};
   const today = domain ? Number(dailyUsage[dateKey]?.[domain] || 0) : 0;
   const trackedToday = totalMinutesForDate(dailyUsage, dateKey);
   const { baseline, recordCount } = baselineForDomain(
@@ -677,10 +1167,44 @@ async function buildSummary() {
   const elapsedMinutesToday = minutesSinceReset(now, settings.dailyResetHour);
   const dailyInsight = predictionInsight(today, baseline, recordCount, trackedToday, elapsedMinutesToday, now);
   const sessionInsight = await buildCurrentSessionInsight(domain, now);
+  const categoryBreakdown = categoryTotalsForUsage(usageToday, domainCategories);
+  const weeklyTrends = buildWeeklyTrends(
+    dailyUsage,
+    sessions,
+    dateKey,
+    settings.dailyResetHour,
+    domainCategories
+  );
+  const insights = buildInsightList({
+    domain,
+    today,
+    baseline,
+    baselineRecordCount: recordCount,
+    currentSessionMinutes: sessionInsight.currentSessionMinutes,
+    typicalSessionMinutes: sessionInsight.typicalSessionMinutes,
+    usageToday,
+    sessions,
+    activeSession,
+    domainCategories,
+    dateKey,
+    resetHour: settings.dailyResetHour,
+    timestamp: now
+  });
+  const debug = await buildDebugInfo(focusSnapshot, activeSession, currentDomain);
 
   return {
     date: dateKey,
     domain,
+    currentDomain,
+    trackingPaused,
+    excludedDomains,
+    currentSiteExcluded: isExcludedDomain(currentDomain, excludedDomains),
+    domainCategory: categoryForDomain(domain, domainCategories),
+    currentDomainCategory: categoryForDomain(currentDomain, domainCategories),
+    categoryBreakdown,
+    insights,
+    weeklyTrends,
+    debug,
     settings,
     baselineType: "same_weekday_average",
     baselineOccurrences: BASELINE_WEEKDAY_OCCURRENCES,
@@ -695,7 +1219,7 @@ async function buildSummary() {
     recommendation: dailyInsight.recommendation,
     ...sessionInsight,
     totalTodayMinutes: displayMinutes(trackedToday),
-    usage: dailyUsage[dateKey] || {}
+    usage: usageToday
   };
 }
 
@@ -729,6 +1253,105 @@ async function syncTodayToBackend() {
   } catch (_error) {
     // Local tracking is the source of truth; the backend is optional for V1.
   }
+}
+
+async function pauseTrackingManually() {
+  await pauseTrackingForIdle(Date.now(), 0, "manual_pause");
+  await chrome.storage.local.set({ trackingPaused: true });
+  await updateBadge();
+  return buildSummary();
+}
+
+async function resumeTrackingManually() {
+  await chrome.storage.local.set({ trackingPaused: false });
+  await refreshActiveContext();
+  return buildSummary();
+}
+
+async function excludeCurrentSite() {
+  const timestamp = Date.now();
+  const { currentDomain } = await getFocusSnapshot();
+  const { activeSession, excludedDomains } = await getAppState();
+
+  if (!currentDomain) {
+    return buildSummary();
+  }
+
+  const nextExcludedDomains = Array.from(new Set([...excludedDomains, currentDomain])).sort();
+
+  if (activeSession?.domain === currentDomain) {
+    await pauseTrackingForIdle(timestamp, 0, "manual_pause");
+  }
+
+  await chrome.storage.local.set({ excludedDomains: nextExcludedDomains });
+  await updateBadge();
+  return buildSummary();
+}
+
+async function setCurrentSiteCategory(category) {
+  const { currentDomain } = await getFocusSnapshot();
+  const { domainCategories } = await getAppState();
+
+  if (!currentDomain) {
+    return buildSummary();
+  }
+
+  await chrome.storage.local.set({
+    domainCategories: {
+      ...domainCategories,
+      [currentDomain]: normalizeCategory(category)
+    }
+  });
+
+  return buildSummary();
+}
+
+async function resetTodaysData() {
+  const timestamp = Date.now();
+  const settings = await getSettings();
+  const dateKey = localDateKey(timestamp, settings.dailyResetHour);
+  const { dailyUsage, trackedDays } = await getDailyUsage();
+  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+  const sessions = await getSessions();
+  const nextStorage = {};
+
+  delete dailyUsage[dateKey];
+  delete trackedDays[dateKey];
+
+  nextStorage.dailyUsage = dailyUsage;
+  nextStorage.trackedDays = trackedDays;
+  nextStorage.sessions = sessions.filter(
+    (session) => sessionDateKey(session, settings.dailyResetHour) !== dateKey
+  );
+
+  if (activeSession?.domain) {
+    nextStorage.activeSession = {
+      ...activeSession,
+      startedAt: timestamp,
+      lastCheckpointAt: timestamp,
+      date: dateKey
+    };
+  }
+
+  await chrome.storage.local.set(nextStorage);
+  await updateBadge();
+  await syncTodayToBackend();
+  return buildSummary();
+}
+
+async function clearAllData() {
+  await chrome.storage.local.remove([
+    "dailyUsage",
+    "trackedDays",
+    "sessions",
+    "activeSession",
+    "trackingPaused",
+    "excludedDomains",
+    "domainCategories"
+  ]);
+  await updateBadge();
+  await refreshActiveContext();
+  return buildSummary();
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -777,29 +1400,42 @@ chrome.windows.onRemoved.addListener(() => {
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === "SAVE_SETTINGS") {
-    enqueue(async () => {
+  const handlers = {
+    SAVE_SETTINGS: async () => {
       const timestamp = Date.now();
       await setSettings({
         dailyResetHour: message.settings?.dailyResetHour === 3 ? 3 : 0
       });
       await checkpointActiveSession(timestamp);
       await refreshActiveContext();
-      const summary = await buildSummary();
-      sendResponse(summary);
-    });
+      return buildSummary();
+    },
+    GET_USAGE_SUMMARY: async () => {
+      await checkpointActiveSession(Date.now());
+      return buildSummary();
+    },
+    PAUSE_TRACKING: pauseTrackingManually,
+    RESUME_TRACKING: resumeTrackingManually,
+    EXCLUDE_CURRENT_SITE: excludeCurrentSite,
+    RESET_TODAY: resetTodaysData,
+    CLEAR_ALL_DATA: clearAllData,
+    SET_CURRENT_SITE_CATEGORY: async () => setCurrentSiteCategory(message.category)
+  };
 
-    return true;
-  }
+  const handler = handlers[message?.type];
 
-  if (message?.type !== "GET_USAGE_SUMMARY") {
+  if (!handler) {
     return false;
   }
 
   enqueue(async () => {
-    await refreshActiveContext();
-    const summary = await buildSummary();
-    sendResponse(summary);
+    try {
+      const summary = await handler();
+      sendResponse(summary);
+    } catch (error) {
+      console.error("LifeCycle message failed", error);
+      sendResponse(null);
+    }
   });
 
   return true;
