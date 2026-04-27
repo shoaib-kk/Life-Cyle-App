@@ -181,7 +181,7 @@ The badge shows total minutes today. The popup shows the active domain first:
 
 The ranked site list reads from `summary.usage`, sorts domains by minutes descending, highlights the active domain, and shows minutes plus share of today's listed usage. Bar width is proportional to the top site.
 
-The detail cards never fall back to the top site for the day. If there is no active trackable tab, the session area says `No active tab`; the ranked list remains the only place where previous sites from today appear.
+The detail cards never fall back to the top site for the day. If there is no active trackable tab, the session area says `No active tab`; if Chrome reports idle while a trackable tab is open, the active domain is still shown and the session status says `Paused`. The ranked list remains the only place where previous sites from today appear.
 
 While the popup is open, it refreshes once per second so the current-session timer stays live.
 
@@ -218,3 +218,4 @@ API:
 - `GET /insights?date=YYYY-MM-DD&weeks=8` returns baseline, status, prediction, confidence, and recommendation
 
 The local API URL used by the extension is `http://127.0.0.1:8000`.
+ 

@@ -435,17 +435,13 @@ async function checkpointActiveSession(timestamp = Date.now(), options = {}) {
 }
 
 async function getFocusedActiveTab() {
-  const windows = await chrome.windows.getAll({
-    populate: true,
-    windowTypes: ["normal"]
+  const [tab] = await chrome.tabs.query({
+    active: true,
+    lastFocusedWindow: true,
+    windowType: "normal"
   });
-  const focusedWindow = windows.find((windowInfo) => windowInfo.focused);
 
-  if (!focusedWindow) {
-    return null;
-  }
-
-  return focusedWindow.tabs.find((tab) => tab.active) || null;
+  return tab || null;
 }
 
 async function pauseTrackingForIdle(timestamp = Date.now(), subtractIdleSeconds = 0) {
@@ -520,12 +516,6 @@ async function startSessionForTab(tab, timestamp = Date.now()) {
 }
 
 async function getCurrentTrackedDomain() {
-  const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
-
-  if (idleState !== "active") {
-    return null;
-  }
-
   const activeTab = await getFocusedActiveTab();
   return activeTab?.url ? normalizeDomain(activeTab.url) : null;
 }
@@ -577,12 +567,13 @@ function baselineForDomain(
 
 async function buildCurrentSessionInsight(domain, timestamp = Date.now()) {
   const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+  const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
 
   if (!domain || !activeSession?.domain || activeSession.domain !== domain) {
     return {
       currentSessionMinutes: "-",
       typicalSessionMinutes: "-",
-      sessionStatus: "No active tab",
+      sessionStatus: domain && idleState !== "active" ? "Paused" : "No active tab",
       sessionConfidence: "-",
       sessionPercentile: null,
       sessionPercentileText: "-",
