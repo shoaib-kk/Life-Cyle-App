@@ -1,6 +1,14 @@
-const BACKEND_URL = "http://127.0.0.1:8000";
-const BASELINE_DAYS = 7;
+﻿const BACKEND_URL = "http://127.0.0.1:8000";
+const BASELINE_WEEKDAY_OCCURRENCES = 8;
 const FULL_DAY_MINUTES = 24 * 60;
+const ABOVE_BASELINE_THRESHOLD = 0.3;
+const SESSION_HISTORY_LIMIT = 500;
+const IDLE_DETECTION_SECONDS = 60;
+const MIN_BASELINE_RECORDS = 2;
+const MIN_SESSION_HISTORY = 2;
+const MIN_TRACKED_DAY_MINUTES_FOR_PREDICTION = 30;
+const MIN_DOMAIN_MINUTES_FOR_PREDICTION = 10;
+const DAILY_HISTORY_RETENTION_DAYS = 70;
 
 let operationQueue = Promise.resolve();
 
@@ -11,38 +19,65 @@ function enqueue(task) {
   return operationQueue;
 }
 
-function localDateKey(timestamp = Date.now()) {
+async function getSettings() {
+  const { settings = {} } = await chrome.storage.local.get({ settings: {} });
+  return {
+    dailyResetHour: settings.dailyResetHour === 3 ? 3 : 0
+  };
+}
+
+async function setSettings(settings) {
+  await chrome.storage.local.set({ settings });
+}
+
+function lifecycleDate(timestamp = Date.now(), resetHour = 0) {
   const date = new Date(timestamp);
+  date.setHours(date.getHours() - resetHour);
+  return date;
+}
+
+function localDateKey(timestamp = Date.now(), resetHour = 0) {
+  const date = lifecycleDate(timestamp, resetHour);
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
-function previousDateKeys(dateKey, count) {
+function previousSameWeekdayDateKeys(dateKey, count, resetHour = 0) {
   const [year, month, day] = dateKey.split("-").map(Number);
-  const date = new Date(year, month - 1, day);
+  const date = new Date(year, month - 1, day, resetHour, 0, 0, 0);
   const keys = [];
 
   for (let index = 1; index <= count; index += 1) {
     const previous = new Date(date);
-    previous.setDate(date.getDate() - index);
-    keys.push(localDateKey(previous.getTime()));
+    previous.setDate(date.getDate() - index * 7);
+    keys.push(localDateKey(previous.getTime(), resetHour));
   }
 
   return keys;
 }
 
-function minutesSinceLocalMidnight(timestamp = Date.now()) {
+function minutesSinceReset(timestamp = Date.now(), resetHour = 0) {
   const date = new Date(timestamp);
-  const midnight = new Date(date);
-  midnight.setHours(0, 0, 0, 0);
-  return Math.max(1, (timestamp - midnight.getTime()) / 60000);
+  const reset = new Date(date);
+  reset.setHours(resetHour, 0, 0, 0);
+
+  if (date < reset) {
+    reset.setDate(reset.getDate() - 1);
+  }
+
+  return Math.max(0, (timestamp - reset.getTime()) / 60000);
 }
 
-function nextLocalMidnight(timestamp) {
+function nextLocalReset(timestamp, resetHour = 0) {
   const date = new Date(timestamp);
-  date.setHours(24, 0, 0, 0);
+  date.setHours(resetHour, 0, 0, 0);
+
+  if (date.getTime() <= timestamp) {
+    date.setDate(date.getDate() + 1);
+  }
+
   return date.getTime();
 }
 
@@ -102,12 +137,50 @@ function displayMinutes(value) {
   return Math.round(value);
 }
 
-function statusText(today, baseline) {
-  if (baseline <= 0) {
-    return today > 0 ? "New activity today" : "No usage yet";
+function displayDomain(domain) {
+  if (!domain) {
+    return "this site";
   }
 
-  const delta = (today - baseline) / baseline;
+  return domain
+    .split(".")[0]
+    .replace(/^\w/, (letter) => letter.toUpperCase());
+}
+
+function toIsoString(timestamp) {
+  return new Date(timestamp).toISOString();
+}
+
+function predictionForDay(currentUsage, elapsedMinutesToday) {
+  if (elapsedMinutesToday <= 0) {
+    return null;
+  }
+
+  return (currentUsage / elapsedMinutesToday) * FULL_DAY_MINUTES;
+}
+
+function confidenceLabel(dataPoints) {
+  if (dataPoints >= 6) {
+    return "High confidence";
+  }
+
+  if (dataPoints >= 3) {
+    return "Medium confidence";
+  }
+
+  if (dataPoints >= 1) {
+    return "Low confidence";
+  }
+
+  return "-";
+}
+
+function statusText(predictedTotal, baseline) {
+  if (baseline <= 0) {
+    return predictedTotal > 0 ? "New activity today" : "No usage yet";
+  }
+
+  const delta = (predictedTotal - baseline) / baseline;
   const percent = Math.round(delta * 100);
 
   if (percent > 0) {
@@ -121,29 +194,192 @@ function statusText(today, baseline) {
   return "On your normal pace";
 }
 
+function predictionInsight(today, baseline, baselineCount, trackedToday, elapsedMinutesToday, timestamp) {
+  if (baselineCount < MIN_BASELINE_RECORDS) {
+    return {
+      averageMinutes: "-",
+      status: "-",
+      prediction: "-",
+      recommendation: "",
+      predictedTotal: null
+    };
+  }
+
+  if (trackedToday < MIN_TRACKED_DAY_MINUTES_FOR_PREDICTION && today < MIN_DOMAIN_MINUTES_FOR_PREDICTION) {
+    const hour = new Date(timestamp).getHours();
+    return {
+      averageMinutes: displayMinutes(baseline),
+      status: "Baseline ready",
+      prediction: hour < 10 ? "Early in day" : "-",
+      recommendation: "",
+      predictedTotal: null
+    };
+  }
+
+  const predictedTotal = predictionForDay(today, elapsedMinutesToday);
+  if (predictedTotal === null) {
+    return {
+      averageMinutes: displayMinutes(baseline),
+      status: "Baseline ready",
+      prediction: "-",
+      recommendation: "",
+      predictedTotal: null
+    };
+  }
+
+  const hour = new Date(timestamp).getHours();
+  const predictionPrefix = hour < 10 ? "Early estimate" : "Prediction";
+
+  return {
+    averageMinutes: displayMinutes(baseline),
+    status: statusText(predictedTotal, baseline),
+    prediction: `${predictionPrefix}: ~${displayMinutes(predictedTotal)} min today`,
+    recommendation: recommendationText(today, baseline, predictedTotal),
+    predictedTotal
+  };
+}
+
 function recommendationText(today, baseline, predictedTotal) {
-  if (baseline > 0 && predictedTotal > baseline) {
-    return "You're trending higher than usual - consider stopping now to stay within your average";
+  if (baseline <= 0) {
+    return today > 0
+      ? "No same-weekday baseline yet - keep tracking to make this meaningful"
+      : "No usage recorded for this site today";
   }
 
-  if (baseline > 0 && today < baseline) {
-    return "You're below your usual pace - keep it there if that is the goal";
+  if (predictedTotal > baseline * (1 + ABOVE_BASELINE_THRESHOLD)) {
+    if (today >= baseline) {
+      return "You've passed your usual full-day usage for this site";
+    }
+
+    return "Stopping now keeps you within your normal range";
   }
 
-  if (today > 0) {
-    return "Keep tracking today so your baseline can become meaningful";
+  if (predictedTotal <= baseline) {
+    return "Stopping now keeps you within your normal range";
   }
 
-  return "No active usage recorded yet today";
+  return "You're above normal pace, but still inside the 30% range";
+}
+
+function median(values) {
+  if (values.length === 0) {
+    return 0;
+  }
+
+  const sorted = [...values].sort((left, right) => left - right);
+  const midpoint = Math.floor(sorted.length / 2);
+
+  if (sorted.length % 2 === 1) {
+    return sorted[midpoint];
+  }
+
+  return (sorted[midpoint - 1] + sorted[midpoint]) / 2;
+}
+
+function percentileLongerThan(currentMinutes, previousDurations) {
+  if (previousDurations.length === 0) {
+    return null;
+  }
+
+  const shorterCount = previousDurations.filter((duration) => currentMinutes > duration).length;
+  return Math.round((shorterCount / previousDurations.length) * 100);
+}
+
+function sessionStatusText(currentMinutes, typicalMinutes) {
+  if (currentMinutes <= 0) {
+    return "No active session";
+  }
+
+  if (typicalMinutes <= 0) {
+    return "Active";
+  }
+
+  if (currentMinutes > typicalMinutes) {
+    return "Above typical";
+  }
+
+  return "Within typical session";
+}
+
+function sessionRecommendationText(currentMinutes, typicalMinutes, percentile, domain) {
+  if (currentMinutes <= 0) {
+    return "";
+  }
+
+  if (typicalMinutes <= 0) {
+    return "";
+  }
+
+  if (currentMinutes > typicalMinutes) {
+    if (percentile !== null) {
+      return `This session is already longer than ${percentile}% of your past ${displayDomain(domain)} sessions`;
+    }
+
+    return "Stop now if this was meant to be a quick check";
+  }
+
+  return "You're still within your typical session length";
 }
 
 async function getDailyUsage() {
-  const { dailyUsage = {} } = await chrome.storage.local.get({ dailyUsage: {} });
-  return dailyUsage;
+  const { dailyUsage = {}, trackedDays = {} } = await chrome.storage.local.get({
+    dailyUsage: {},
+    trackedDays: {}
+  });
+  return { dailyUsage, trackedDays };
 }
 
-async function setDailyUsage(dailyUsage) {
-  await chrome.storage.local.set({ dailyUsage });
+async function setDailyUsage(dailyUsage, trackedDays) {
+  await chrome.storage.local.set({ dailyUsage, trackedDays });
+}
+
+function pruneDailyHistory(dailyUsage, trackedDays, timestamp = Date.now(), resetHour = 0) {
+  const cutoffDate = lifecycleDate(timestamp, resetHour);
+  cutoffDate.setDate(cutoffDate.getDate() - DAILY_HISTORY_RETENTION_DAYS);
+  const cutoffKey = localDateKey(cutoffDate.getTime(), 0);
+
+  for (const dateKey of Object.keys(dailyUsage)) {
+    if (dateKey < cutoffKey) {
+      delete dailyUsage[dateKey];
+    }
+  }
+
+  for (const dateKey of Object.keys(trackedDays)) {
+    if (dateKey < cutoffKey) {
+      delete trackedDays[dateKey];
+    }
+  }
+}
+
+async function getSessions() {
+  const { sessions = [] } = await chrome.storage.local.get({ sessions: [] });
+  return Array.isArray(sessions) ? sessions : [];
+}
+
+async function saveCompletedSession(activeSession, endedAt) {
+  const startedAt = activeSession.startedAt || activeSession.lastCheckpointAt;
+
+  if (!activeSession.domain || !startedAt || endedAt <= startedAt) {
+    return;
+  }
+
+  const durationMinutes = roundMinutes((endedAt - startedAt) / 60000);
+
+  if (durationMinutes <= 0) {
+    return;
+  }
+
+  const sessions = await getSessions();
+  sessions.push({
+    domain: activeSession.domain,
+    startTime: toIsoString(startedAt),
+    endTime: toIsoString(endedAt),
+    durationMinutes
+  });
+
+  await chrome.storage.local.set({
+    sessions: sessions.slice(-SESSION_HISTORY_LIMIT)
+  });
 }
 
 async function addUsageMinutes(domain, startedAt, endedAt) {
@@ -151,13 +387,16 @@ async function addUsageMinutes(domain, startedAt, endedAt) {
     return;
   }
 
-  const dailyUsage = await getDailyUsage();
+  const settings = await getSettings();
+  const { dailyUsage, trackedDays } = await getDailyUsage();
   let cursor = startedAt;
 
   while (cursor < endedAt) {
-    const boundary = Math.min(nextLocalMidnight(cursor), endedAt);
-    const dateKey = localDateKey(cursor);
+    const boundary = Math.min(nextLocalReset(cursor, settings.dailyResetHour), endedAt);
+    const dateKey = localDateKey(cursor, settings.dailyResetHour);
     const minutes = (boundary - cursor) / 60000;
+
+    trackedDays[dateKey] = true;
 
     if (!dailyUsage[dateKey]) {
       dailyUsage[dateKey] = {};
@@ -167,26 +406,30 @@ async function addUsageMinutes(domain, startedAt, endedAt) {
     cursor = boundary;
   }
 
-  await setDailyUsage(dailyUsage);
+  pruneDailyHistory(dailyUsage, trackedDays, endedAt, settings.dailyResetHour);
+  await setDailyUsage(dailyUsage, trackedDays);
 }
 
-async function checkpointActiveSession(timestamp = Date.now()) {
+async function checkpointActiveSession(timestamp = Date.now(), options = {}) {
   const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
 
-  if (!activeSession || !activeSession.domain || !activeSession.startedAt) {
+  if (!activeSession || !activeSession.domain) {
     return;
   }
 
-  if (timestamp <= activeSession.startedAt) {
+  const checkpointAt = activeSession.lastCheckpointAt || activeSession.startedAt;
+  const endedAt = Math.max(checkpointAt, timestamp - (options.subtractIdleSeconds || 0) * 1000);
+
+  if (!checkpointAt || endedAt <= checkpointAt) {
     return;
   }
 
-  await addUsageMinutes(activeSession.domain, activeSession.startedAt, timestamp);
+  await addUsageMinutes(activeSession.domain, checkpointAt, endedAt);
   await chrome.storage.local.set({
     activeSession: {
       ...activeSession,
-      startedAt: timestamp,
-      date: localDateKey(timestamp)
+      lastCheckpointAt: endedAt,
+      date: localDateKey(endedAt, (await getSettings()).dailyResetHour)
     }
   });
 }
@@ -205,12 +448,63 @@ async function getFocusedActiveTab() {
   return focusedWindow.tabs.find((tab) => tab.active) || null;
 }
 
+async function pauseTrackingForIdle(timestamp = Date.now(), subtractIdleSeconds = 0) {
+  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+
+  if (!activeSession?.domain) {
+    return;
+  }
+
+  const checkpointAt = activeSession.lastCheckpointAt || activeSession.startedAt || timestamp;
+  const endedAt = Math.max(checkpointAt, timestamp - subtractIdleSeconds * 1000);
+
+  if (endedAt > checkpointAt) {
+    await addUsageMinutes(activeSession.domain, checkpointAt, endedAt);
+  }
+
+  await saveCompletedSession(activeSession, endedAt);
+  await chrome.storage.local.remove("activeSession");
+}
+
+async function resumeTrackingIfActive() {
+  const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
+
+  if (idleState === "active") {
+    await refreshActiveContext();
+  }
+}
+
 async function startSessionForTab(tab, timestamp = Date.now()) {
   const domain = tab?.url ? normalizeDomain(tab.url) : null;
+  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+  const settings = await getSettings();
 
   if (!domain) {
+    if (activeSession?.domain) {
+      await saveCompletedSession(activeSession, timestamp);
+    }
+
     await chrome.storage.local.remove("activeSession");
     return;
+  }
+
+  if (activeSession?.domain === domain) {
+    await chrome.storage.local.set({
+      activeSession: {
+        ...activeSession,
+        domain,
+        tabId: tab.id,
+        windowId: tab.windowId,
+        startedAt: activeSession.startedAt || activeSession.lastCheckpointAt || timestamp,
+        lastCheckpointAt: activeSession.lastCheckpointAt || activeSession.startedAt || timestamp,
+        date: localDateKey(timestamp, settings.dailyResetHour)
+      }
+    });
+    return;
+  }
+
+  if (activeSession?.domain) {
+    await saveCompletedSession(activeSession, timestamp);
   }
 
   await chrome.storage.local.set({
@@ -219,13 +513,33 @@ async function startSessionForTab(tab, timestamp = Date.now()) {
       tabId: tab.id,
       windowId: tab.windowId,
       startedAt: timestamp,
-      date: localDateKey(timestamp)
+      lastCheckpointAt: timestamp,
+      date: localDateKey(timestamp, settings.dailyResetHour)
     }
   });
 }
 
+async function getCurrentTrackedDomain() {
+  const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
+
+  if (idleState !== "active") {
+    return null;
+  }
+
+  const activeTab = await getFocusedActiveTab();
+  return activeTab?.url ? normalizeDomain(activeTab.url) : null;
+}
+
 async function refreshActiveContext() {
   const timestamp = Date.now();
+  const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
+
+  if (idleState !== "active") {
+    await pauseTrackingForIdle(timestamp, IDLE_DETECTION_SECONDS);
+    await updateBadge();
+    return;
+  }
+
   await checkpointActiveSession(timestamp);
   const activeTab = await getFocusedActiveTab();
   await startSessionForTab(activeTab, timestamp);
@@ -237,55 +551,129 @@ function totalMinutesForDate(dailyUsage, dateKey) {
   return Object.values(dailyUsage[dateKey] || {}).reduce((sum, minutes) => sum + Number(minutes || 0), 0);
 }
 
-function topDomainForDate(dailyUsage, dateKey) {
-  const entries = Object.entries(dailyUsage[dateKey] || {});
-
-  if (entries.length === 0) {
-    return null;
-  }
-
-  entries.sort((left, right) => right[1] - left[1]);
-  return entries[0][0];
-}
-
-function baselineForDomain(dailyUsage, dateKey, domain, days = BASELINE_DAYS) {
+function baselineForDomain(
+  dailyUsage,
+  trackedDays,
+  dateKey,
+  domain,
+  occurrences = BASELINE_WEEKDAY_OCCURRENCES,
+  resetHour = 0
+) {
   if (!domain) {
-    return 0;
+    return { baseline: 0, recordCount: 0 };
   }
 
-  const dates = previousDateKeys(dateKey, days);
-  const total = dates.reduce((sum, previousDate) => {
-    return sum + Number(dailyUsage[previousDate]?.[domain] || 0);
+  const dates = previousSameWeekdayDateKeys(dateKey, occurrences, resetHour);
+  const recordedDates = dates.filter((previousDate) => trackedDays[previousDate]);
+  const total = recordedDates.reduce((sum, previousDate) => {
+    return sum + Number(dailyUsage[previousDate]?.[domain] ?? 0);
   }, 0);
 
-  return total / days;
+  return {
+    baseline: recordedDates.length > 0 ? total / recordedDates.length : 0,
+    recordCount: recordedDates.length
+  };
+}
+
+async function buildCurrentSessionInsight(domain, timestamp = Date.now()) {
+  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+
+  if (!domain || !activeSession?.domain || activeSession.domain !== domain) {
+    return {
+      currentSessionMinutes: "-",
+      typicalSessionMinutes: "-",
+      sessionStatus: "No active tab",
+      sessionConfidence: "-",
+      sessionPercentile: null,
+      sessionPercentileText: "-",
+      sessionRecommendation: ""
+    };
+  }
+
+  const startedAt = activeSession.startedAt || activeSession.lastCheckpointAt || timestamp;
+  const currentSessionMinutes = Math.max(0, (timestamp - startedAt) / 60000);
+  const sessions = await getSessions();
+  const previousDurations = sessions
+    .filter((session) => session.domain === domain)
+    .map((session) => Number(session.durationMinutes || 0))
+    .filter((duration) => duration > 0);
+  const typicalSessionMinutes = median(previousDurations);
+  const percentile = percentileLongerThan(currentSessionMinutes, previousDurations);
+  const sessionConfidence = confidenceLabel(previousDurations.length);
+
+  if (previousDurations.length < MIN_SESSION_HISTORY) {
+    return {
+      currentSessionMinutes: displayMinutes(currentSessionMinutes),
+      typicalSessionMinutes: "-",
+      sessionStatus: "Active",
+      sessionConfidence: "-",
+      sessionPercentile: percentile,
+      sessionPercentileText: "-",
+      sessionRecommendation: ""
+    };
+  }
+
+  return {
+    currentSessionMinutes: displayMinutes(currentSessionMinutes),
+    typicalSessionMinutes: displayMinutes(typicalSessionMinutes),
+    sessionStatus: sessionStatusText(currentSessionMinutes, typicalSessionMinutes),
+    sessionConfidence,
+    sessionPercentile: percentile,
+    sessionPercentileText:
+      percentile === null
+        ? "-"
+        : `Longer than ${percentile}% of previous ${domain} sessions`,
+    sessionRecommendation: sessionRecommendationText(currentSessionMinutes, typicalSessionMinutes, percentile, domain)
+  };
 }
 
 async function buildSummary() {
   const now = Date.now();
-  const dateKey = localDateKey(now);
-  const dailyUsage = await getDailyUsage();
-  const domain = topDomainForDate(dailyUsage, dateKey);
+  const settings = await getSettings();
+  const dateKey = localDateKey(now, settings.dailyResetHour);
+  const { dailyUsage, trackedDays } = await getDailyUsage();
+  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+  const currentDomain = await getCurrentTrackedDomain();
+  const domain = activeSession?.domain || currentDomain || null;
   const today = domain ? Number(dailyUsage[dateKey]?.[domain] || 0) : 0;
-  const baseline = baselineForDomain(dailyUsage, dateKey, domain);
-  const predictedTotal = (today / minutesSinceLocalMidnight(now)) * FULL_DAY_MINUTES;
+  const trackedToday = totalMinutesForDate(dailyUsage, dateKey);
+  const { baseline, recordCount } = baselineForDomain(
+    dailyUsage,
+    trackedDays,
+    dateKey,
+    domain,
+    BASELINE_WEEKDAY_OCCURRENCES,
+    settings.dailyResetHour
+  );
+  const elapsedMinutesToday = minutesSinceReset(now, settings.dailyResetHour);
+  const dailyInsight = predictionInsight(today, baseline, recordCount, trackedToday, elapsedMinutesToday, now);
+  const sessionInsight = await buildCurrentSessionInsight(domain, now);
 
   return {
     date: dateKey,
     domain,
+    settings,
+    baselineType: "same_weekday_average",
+    baselineOccurrences: BASELINE_WEEKDAY_OCCURRENCES,
+    baselineRecordCount: recordCount,
+    baselineConfidence: recordCount >= MIN_BASELINE_RECORDS ? confidenceLabel(recordCount) : "-",
+    predictionFormula: "predicted_total = (current_usage / elapsed_minutes_today) * 1440",
+    elapsedMinutesToday: displayMinutes(elapsedMinutesToday),
     todayMinutes: displayMinutes(today),
-    averageMinutes: displayMinutes(baseline),
-    status: statusText(today, baseline),
-    prediction: `~${displayMinutes(predictedTotal)} min today`,
-    recommendation: recommendationText(today, baseline, predictedTotal),
-    totalTodayMinutes: displayMinutes(totalMinutesForDate(dailyUsage, dateKey)),
+    averageMinutes: dailyInsight.averageMinutes,
+    status: dailyInsight.status,
+    prediction: dailyInsight.prediction,
+    recommendation: dailyInsight.recommendation,
+    ...sessionInsight,
+    totalTodayMinutes: displayMinutes(trackedToday),
     usage: dailyUsage[dateKey] || {}
   };
 }
 
 async function updateBadge() {
-  const dateKey = localDateKey();
-  const dailyUsage = await getDailyUsage();
+  const settings = await getSettings();
+  const dateKey = localDateKey(Date.now(), settings.dailyResetHour);
+  const { dailyUsage } = await getDailyUsage();
   const total = displayMinutes(totalMinutesForDate(dailyUsage, dateKey));
   const text = total > 999 ? `${Math.round(total / 60)}h` : String(total);
 
@@ -294,11 +682,12 @@ async function updateBadge() {
 }
 
 async function syncTodayToBackend() {
-  const dateKey = localDateKey();
-  const dailyUsage = await getDailyUsage();
+  const settings = await getSettings();
+  const dateKey = localDateKey(Date.now(), settings.dailyResetHour);
+  const { dailyUsage, trackedDays } = await getDailyUsage();
   const usage = dailyUsage[dateKey] || {};
 
-  if (Object.keys(usage).length === 0) {
+  if (!trackedDays[dateKey]) {
     return;
   }
 
@@ -306,7 +695,7 @@ async function syncTodayToBackend() {
     await fetch(`${BACKEND_URL}/usage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ date: dateKey, usage })
+      body: JSON.stringify({ date: dateKey, usage, tracked: true })
     });
   } catch (_error) {
     // Local tracking is the source of truth; the backend is optional for V1.
@@ -314,13 +703,24 @@ async function syncTodayToBackend() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
+  chrome.idle.setDetectionInterval(IDLE_DETECTION_SECONDS);
   chrome.alarms.create("lifecycle-checkpoint", { periodInMinutes: 1 });
   enqueue(refreshActiveContext);
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  chrome.idle.setDetectionInterval(IDLE_DETECTION_SECONDS);
   chrome.alarms.create("lifecycle-checkpoint", { periodInMinutes: 1 });
   enqueue(refreshActiveContext);
+});
+
+chrome.idle.onStateChanged.addListener((state) => {
+  if (state === "idle" || state === "locked") {
+    enqueue(() => pauseTrackingForIdle(Date.now(), IDLE_DETECTION_SECONDS));
+    return;
+  }
+
+  enqueue(resumeTrackingIfActive);
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -348,17 +748,32 @@ chrome.windows.onRemoved.addListener(() => {
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "SAVE_SETTINGS") {
+    enqueue(async () => {
+      const timestamp = Date.now();
+      await setSettings({
+        dailyResetHour: message.settings?.dailyResetHour === 3 ? 3 : 0
+      });
+      await checkpointActiveSession(timestamp);
+      await refreshActiveContext();
+      const summary = await buildSummary();
+      sendResponse(summary);
+    });
+
+    return true;
+  }
+
   if (message?.type !== "GET_USAGE_SUMMARY") {
     return false;
   }
 
   enqueue(async () => {
-    await checkpointActiveSession();
-    await updateBadge();
-    await syncTodayToBackend();
+    await refreshActiveContext();
     const summary = await buildSummary();
     sendResponse(summary);
   });
 
   return true;
 });
+
+
