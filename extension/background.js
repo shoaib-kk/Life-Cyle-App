@@ -55,11 +55,13 @@ function normalizeStoredList(value) {
 async function getAppState() {
   const {
     activeSession = null,
+    currentUsage = null,
     trackingPaused = false,
     excludedDomains = [],
     domainCategories = {}
   } = await chrome.storage.local.get({
     activeSession: null,
+    currentUsage: null,
     trackingPaused: false,
     excludedDomains: [],
     domainCategories: {}
@@ -67,6 +69,7 @@ async function getAppState() {
 
   return {
     activeSession,
+    currentUsage,
     trackingPaused: Boolean(trackingPaused),
     excludedDomains: normalizeStoredList(excludedDomains),
     domainCategories: domainCategories && typeof domainCategories === "object" ? domainCategories : {}
@@ -502,12 +505,6 @@ async function saveCompletedSessionIfGapElapsed(activeSession, timestamp, reason
   }
 
   const endedAt = sessionLastSeenAt(activeSession) || timestamp;
-  const checkpointAt = activeSession.lastCheckpointAt || activeSession.startedAt || endedAt;
-
-  if (endedAt > checkpointAt) {
-    await addUsageMinutes(activeSession.domain, checkpointAt, endedAt);
-  }
-
   await saveCompletedSession(activeSession, endedAt, reasonEnded);
   return true;
 }
@@ -540,36 +537,77 @@ async function addUsageMinutes(domain, startedAt, endedAt) {
   await setDailyUsage(dailyUsage, trackedDays);
 }
 
-async function checkpointActiveSession(timestamp = Date.now(), options = {}) {
-  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+async function checkpointCurrentUsage(timestamp = Date.now(), options = {}) {
+  const { currentUsage = null } = await chrome.storage.local.get({ currentUsage: null });
 
-  if (!activeSession || !activeSession.domain) {
+  if (!currentUsage?.domain) {
     return;
   }
 
-  const checkpointAt = activeSession.lastCheckpointAt || activeSession.startedAt;
-  const rawEndedAt = Math.max(checkpointAt, timestamp - (options.subtractIdleSeconds || 0) * 1000);
-  const shouldCapAtLastSeen =
-    Boolean(activeSession.awaySince) &&
-    options.currentDomain !== undefined &&
-    options.currentDomain !== activeSession.domain;
-  const endedAt = shouldCapAtLastSeen
-    ? Math.min(rawEndedAt, sessionLastSeenAt(activeSession) || rawEndedAt)
-    : rawEndedAt;
+  const checkpointAt = currentUsage.lastCheckpointAt || currentUsage.startedAt || timestamp;
+  const endedAt = Math.max(checkpointAt, timestamp - (options.subtractIdleSeconds || 0) * 1000);
 
-  if (!checkpointAt || endedAt <= checkpointAt) {
+  if (endedAt > checkpointAt) {
+    await addUsageMinutes(currentUsage.domain, checkpointAt, endedAt);
+  }
+
+  if (options.clear) {
+    await chrome.storage.local.remove("currentUsage");
     return;
   }
 
-  await addUsageMinutes(activeSession.domain, checkpointAt, endedAt);
   await chrome.storage.local.set({
-    activeSession: {
-      ...activeSession,
+    currentUsage: {
+      ...currentUsage,
       lastCheckpointAt: endedAt,
-      lastSeenAt: shouldCapAtLastSeen ? sessionLastSeenAt(activeSession) : endedAt,
       date: localDateKey(endedAt, (await getSettings()).dailyResetHour)
     }
   });
+}
+
+async function updateCurrentUsage(domain, tab, timestamp = Date.now()) {
+  const settings = await getSettings();
+  const { currentUsage = null } = await chrome.storage.local.get({ currentUsage: null });
+
+  if (!domain) {
+    await checkpointCurrentUsage(timestamp, { clear: true });
+    return;
+  }
+
+  if (currentUsage?.domain && currentUsage.domain !== domain) {
+    await checkpointCurrentUsage(timestamp, { clear: true });
+  } else if (currentUsage?.domain === domain) {
+    await checkpointCurrentUsage(timestamp);
+  }
+
+  const { currentUsage: refreshedUsage = null } = await chrome.storage.local.get({ currentUsage: null });
+
+  if (refreshedUsage?.domain === domain) {
+    await chrome.storage.local.set({
+      currentUsage: {
+        ...refreshedUsage,
+        tabId: tab?.id,
+        windowId: tab?.windowId,
+        date: localDateKey(timestamp, settings.dailyResetHour)
+      }
+    });
+    return;
+  }
+
+  await chrome.storage.local.set({
+    currentUsage: {
+      domain,
+      tabId: tab?.id,
+      windowId: tab?.windowId,
+      startedAt: timestamp,
+      lastCheckpointAt: timestamp,
+      date: localDateKey(timestamp, settings.dailyResetHour)
+    }
+  });
+}
+
+async function checkpointActiveSession(timestamp = Date.now()) {
+  await checkpointCurrentUsage(timestamp);
 }
 
 async function getFocusSnapshot() {
@@ -597,28 +635,36 @@ async function getFocusedActiveTab() {
 }
 
 async function pauseTrackingForIdle(timestamp = Date.now(), subtractIdleSeconds = 0, reasonEnded = "idle") {
-  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+  const {
+    activeSession = null,
+    currentUsage = null
+  } = await chrome.storage.local.get({
+    activeSession: null,
+    currentUsage: null
+  });
+
+  await checkpointCurrentUsage(timestamp, {
+    subtractIdleSeconds,
+    clear: true
+  });
 
   if (!activeSession?.domain) {
     return;
   }
 
-  const checkpointAt = activeSession.lastCheckpointAt || activeSession.startedAt || timestamp;
-  const existingLastSeenAt = sessionLastSeenAt(activeSession);
-  const endedAt = activeSession.awaySince
-    ? existingLastSeenAt
-    : Math.max(checkpointAt, timestamp - subtractIdleSeconds * 1000);
-
-  if (endedAt > checkpointAt) {
-    await addUsageMinutes(activeSession.domain, checkpointAt, endedAt);
-  }
-
-  const pausedSession = {
-    ...activeSession,
-    lastCheckpointAt: endedAt,
-    lastSeenAt: endedAt,
-    awaySince: activeSession.awaySince || endedAt
-  };
+  const currentEndedAt = Math.max(
+    sessionLastSeenAt(activeSession) || timestamp,
+    timestamp - subtractIdleSeconds * 1000
+  );
+  const pausedSession =
+    currentUsage?.domain === activeSession.domain
+      ? {
+          ...activeSession,
+          lastCheckpointAt: currentEndedAt,
+          lastSeenAt: currentEndedAt,
+          date: localDateKey(currentEndedAt, (await getSettings()).dailyResetHour)
+        }
+      : activeSession;
 
   if (await saveCompletedSessionIfGapElapsed(pausedSession, timestamp, reasonEnded)) {
     await chrome.storage.local.remove("activeSession");
@@ -639,14 +685,17 @@ async function resumeTrackingIfActive() {
 async function startSessionForTab(tab, timestamp = Date.now()) {
   const domain = tab?.url ? normalizeDomain(tab.url) : null;
   console.log("Starting session for:", domain);
-  const { activeSession, trackingPaused, excludedDomains } = await getAppState();
+  const { activeSession, currentUsage, trackingPaused, excludedDomains } = await getAppState();
   const settings = await getSettings();
 
   if (!domain) {
+    await updateCurrentUsage(null, null, timestamp);
     return;
   }
 
   if (trackingPaused || isExcludedDomain(domain, excludedDomains)) {
+    await updateCurrentUsage(null, null, timestamp);
+
     if (
       activeSession?.domain &&
       await saveCompletedSessionIfGapElapsed(activeSession, timestamp, "manual_pause")
@@ -657,15 +706,51 @@ async function startSessionForTab(tab, timestamp = Date.now()) {
     return;
   }
 
-  if (activeSession?.domain === domain) {
-    if (activeSession.awaySince && sessionGapElapsed(activeSession, timestamp)) {
-      await saveCompletedSessionIfGapElapsed(activeSession, timestamp, "tab_change");
+  let sessionState = activeSession;
+
+  if (
+    activeSession?.domain &&
+    activeSession.domain !== domain &&
+    currentUsage?.domain === activeSession.domain
+  ) {
+    sessionState = {
+      ...activeSession,
+      lastCheckpointAt: timestamp,
+      lastSeenAt: timestamp,
+      date: localDateKey(timestamp, settings.dailyResetHour)
+    };
+  }
+
+  await updateCurrentUsage(domain, tab, timestamp);
+  const { currentUsage: updatedUsage = null } = await chrome.storage.local.get({ currentUsage: null });
+  const sessionStartedAt = updatedUsage?.domain === domain
+    ? updatedUsage.startedAt || timestamp
+    : timestamp;
+
+  if (!sessionState?.domain) {
+    await chrome.storage.local.set({
+      activeSession: {
+        domain,
+        tabId: tab.id,
+        windowId: tab.windowId,
+        startedAt: sessionStartedAt,
+        lastCheckpointAt: timestamp,
+        lastSeenAt: timestamp,
+        date: localDateKey(timestamp, settings.dailyResetHour)
+      }
+    });
+    return;
+  }
+
+  if (sessionState?.domain === domain) {
+    if (sessionGapElapsed(sessionState, timestamp)) {
+      await saveCompletedSessionIfGapElapsed(sessionState, timestamp, "tab_change");
       await chrome.storage.local.set({
         activeSession: {
           domain,
           tabId: tab.id,
           windowId: tab.windowId,
-          startedAt: timestamp,
+          startedAt: sessionStartedAt,
           lastCheckpointAt: timestamp,
           lastSeenAt: timestamp,
           date: localDateKey(timestamp, settings.dailyResetHour)
@@ -674,20 +759,29 @@ async function startSessionForTab(tab, timestamp = Date.now()) {
       return;
     }
 
-    const {
-      awaySince: _awaySince,
-      pendingDomain: _pendingDomain,
-      pendingStartedAt: _pendingStartedAt,
-      pendingTabId: _pendingTabId,
-      pendingWindowId: _pendingWindowId,
-      ...resumedSession
-    } = activeSession;
+    await chrome.storage.local.set({
+      activeSession: {
+        ...sessionState,
+        tabId: tab.id,
+        windowId: tab.windowId,
+        lastSeenAt: timestamp,
+        lastCheckpointAt: timestamp,
+        date: localDateKey(timestamp, settings.dailyResetHour)
+      }
+    });
+    return;
+  }
+
+  if (sessionGapElapsed(sessionState, timestamp)) {
+    await saveCompletedSessionIfGapElapsed(sessionState, timestamp, "tab_change");
 
     await chrome.storage.local.set({
       activeSession: {
-        ...resumedSession,
+        domain,
         tabId: tab.id,
         windowId: tab.windowId,
+        startedAt: sessionStartedAt,
+        lastCheckpointAt: timestamp,
         lastSeenAt: timestamp,
         date: localDateKey(timestamp, settings.dailyResetHour)
       }
@@ -695,42 +789,9 @@ async function startSessionForTab(tab, timestamp = Date.now()) {
     return;
   }
 
-  if (activeSession?.domain) {
-    if (!sessionGapElapsed(activeSession, timestamp)) {
-      await chrome.storage.local.set({
-        activeSession: {
-          ...activeSession,
-          pendingDomain: domain,
-          pendingStartedAt:
-            activeSession.pendingDomain === domain
-              ? activeSession.pendingStartedAt
-              : timestamp,
-          pendingTabId: tab.id,
-          pendingWindowId: tab.windowId
-        }
-      });
-      return;
-    }
-
-    await saveCompletedSessionIfGapElapsed(activeSession, timestamp, "tab_change");
+  if (sessionState !== activeSession) {
+    await chrome.storage.local.set({ activeSession: sessionState });
   }
-
-  const startedAt =
-    activeSession?.pendingDomain === domain && activeSession.pendingStartedAt
-      ? activeSession.pendingStartedAt
-      : timestamp;
-
-  await chrome.storage.local.set({
-    activeSession: {
-      domain,
-      tabId: tab.id,
-      windowId: tab.windowId,
-      startedAt,
-      lastCheckpointAt: startedAt,
-      lastSeenAt: timestamp,
-      date: localDateKey(timestamp, settings.dailyResetHour)
-    }
-  });
 }
 
 async function getCurrentTrackedDomain() {
@@ -745,6 +806,7 @@ async function refreshActiveContext() {
   const { focusedWindow, activeTab, currentDomain: newDomain } = await getFocusSnapshot();
 
   if (trackingPaused) {
+    await updateCurrentUsage(null, null, timestamp);
     await updateBadge();
     return;
   }
@@ -759,14 +821,14 @@ async function refreshActiveContext() {
   await checkpointActiveSession(timestamp, { currentDomain: newDomain });
   let { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
 
-  if (!focusedWindow && activeSession?.domain) {
+  if (!focusedWindow) {
     await pauseTrackingForIdle(timestamp, 0, "window_blur");
     await updateBadge();
     await syncTodayToBackend();
     return;
   }
 
-  if (!newDomain && activeSession?.domain) {
+  if (!newDomain) {
     await pauseTrackingForIdle(timestamp, 0, "tab_change");
     await updateBadge();
     await syncTodayToBackend();
@@ -774,10 +836,7 @@ async function refreshActiveContext() {
   }
 
   if (isExcludedDomain(newDomain, excludedDomains)) {
-    if (activeSession?.domain) {
-      await pauseTrackingForIdle(timestamp, 0, "manual_pause");
-    }
-
+    await pauseTrackingForIdle(timestamp, 0, "manual_pause");
     await updateBadge();
     await syncTodayToBackend();
     return;
@@ -785,31 +844,6 @@ async function refreshActiveContext() {
 
   console.log("NEW DOMAIN:", newDomain);
   console.log("OLD DOMAIN:", activeSession?.domain);
-
-  // Only reset if we actually have a valid new domain AND it changed
-  if (
-    activeSession?.domain &&
-    newDomain &&
-    newDomain !== activeSession.domain
-  ) {
-    const pendingStartedAt =
-      activeSession.pendingDomain === newDomain
-        ? activeSession.pendingStartedAt
-        : timestamp;
-
-    await chrome.storage.local.set({
-      activeSession: {
-        ...activeSession,
-        lastSeenAt: activeSession.awaySince ? activeSession.lastSeenAt : timestamp,
-        lastCheckpointAt: activeSession.awaySince ? activeSession.lastCheckpointAt : timestamp,
-        awaySince: activeSession.awaySince || timestamp,
-        pendingDomain: newDomain,
-        pendingStartedAt,
-        pendingTabId: activeTab?.id,
-        pendingWindowId: activeTab?.windowId
-      }
-    });
-  }
 
   await startSessionForTab(activeTab, timestamp);
   await updateBadge();
@@ -890,10 +924,7 @@ async function buildCurrentSessionInsight(domain, timestamp = Date.now()) {
 
   // Use startedAt so checkpoints do not reset the visible session duration
   const sessionStart = activeSession.startedAt || activeSession.lastCheckpointAt || timestamp;
-  const visibleEndedAt = activeSession.awaySince
-    ? sessionLastSeenAt(activeSession) || timestamp
-    : timestamp;
-  const currentSessionMinutes = Math.max(0, (visibleEndedAt - sessionStart) / 60000);
+  const currentSessionMinutes = Math.max(0, (timestamp - sessionStart) / 60000);
   const sessions = await getSessions();
   const previousDurations = sessions
     .filter((session) => session.domain === domain)
@@ -1281,6 +1312,8 @@ async function excludeCurrentSite() {
 
   if (activeSession?.domain === currentDomain) {
     await pauseTrackingForIdle(timestamp, 0, "manual_pause");
+  } else {
+    await checkpointCurrentUsage(timestamp, { clear: true });
   }
 
   await chrome.storage.local.set({ excludedDomains: nextExcludedDomains });
@@ -1311,7 +1344,13 @@ async function resetTodaysData() {
   const settings = await getSettings();
   const dateKey = localDateKey(timestamp, settings.dailyResetHour);
   const { dailyUsage, trackedDays } = await getDailyUsage();
-  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+  const {
+    activeSession = null,
+    currentUsage = null
+  } = await chrome.storage.local.get({
+    activeSession: null,
+    currentUsage: null
+  });
   const sessions = await getSessions();
   const nextStorage = {};
 
@@ -1327,6 +1366,16 @@ async function resetTodaysData() {
   if (activeSession?.domain) {
     nextStorage.activeSession = {
       ...activeSession,
+      startedAt: timestamp,
+      lastCheckpointAt: timestamp,
+      lastSeenAt: timestamp,
+      date: dateKey
+    };
+  }
+
+  if (currentUsage?.domain) {
+    nextStorage.currentUsage = {
+      ...currentUsage,
       startedAt: timestamp,
       lastCheckpointAt: timestamp,
       date: dateKey
@@ -1345,6 +1394,7 @@ async function clearAllData() {
     "trackedDays",
     "sessions",
     "activeSession",
+    "currentUsage",
     "trackingPaused",
     "excludedDomains",
     "domainCategories"
