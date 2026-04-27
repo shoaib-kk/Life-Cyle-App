@@ -435,10 +435,17 @@ async function checkpointActiveSession(timestamp = Date.now(), options = {}) {
 }
 
 async function getFocusedActiveTab() {
+  // First check if there's actually a focused Chrome window
+  const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+  const focusedWindow = windows.find((w) => w.focused);
+
+  if (!focusedWindow) {
+    return null;
+  }
+
   const [tab] = await chrome.tabs.query({
     active: true,
-    lastFocusedWindow: true,
-    windowType: "normal"
+    windowId: focusedWindow.id
   });
 
   return tab || null;
@@ -485,14 +492,12 @@ async function startSessionForTab(tab, timestamp = Date.now()) {
   }
 
   if (activeSession?.domain === domain) {
+    // Already tracking this domain — only update window/tab refs, keep timing intact
     await chrome.storage.local.set({
       activeSession: {
         ...activeSession,
-        domain,
         tabId: tab.id,
         windowId: tab.windowId,
-        startedAt: activeSession.startedAt || activeSession.lastCheckpointAt || timestamp,
-        lastCheckpointAt: activeSession.lastCheckpointAt || activeSession.startedAt || timestamp,
         date: localDateKey(timestamp, settings.dailyResetHour)
       }
     });
@@ -530,8 +535,19 @@ async function refreshActiveContext() {
     return;
   }
 
+  // Checkpoint first so any elapsed time on the current session is saved
   await checkpointActiveSession(timestamp);
+
   const activeTab = await getFocusedActiveTab();
+  const newDomain = activeTab?.url ? normalizeDomain(activeTab.url) : null;
+  const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
+
+  // If the domain has changed, close out the old session and start fresh
+  if (activeSession?.domain && newDomain !== activeSession.domain) {
+    await saveCompletedSession(activeSession, timestamp);
+    await chrome.storage.local.remove("activeSession");
+  }
+
   await startSessionForTab(activeTab, timestamp);
   await updateBadge();
   await syncTodayToBackend();
@@ -569,7 +585,11 @@ async function buildCurrentSessionInsight(domain, timestamp = Date.now()) {
   const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
   const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
 
-  if (!domain || !activeSession?.domain || activeSession.domain !== domain) {
+  // Match against activeSession.domain directly; domain param is the resolved current domain
+  const sessionDomain = activeSession?.domain || null;
+  const isTracking = sessionDomain && sessionDomain === domain;
+
+  if (!isTracking) {
     return {
       currentSessionMinutes: "-",
       typicalSessionMinutes: "-",
@@ -581,8 +601,9 @@ async function buildCurrentSessionInsight(domain, timestamp = Date.now()) {
     };
   }
 
-  const startedAt = activeSession.startedAt || activeSession.lastCheckpointAt || timestamp;
-  const currentSessionMinutes = Math.max(0, (timestamp - startedAt) / 60000);
+  // Use lastCheckpointAt as the session start for display so idle gaps don't inflate the timer
+  const sessionStart = activeSession.lastCheckpointAt || activeSession.startedAt || timestamp;
+  const currentSessionMinutes = Math.max(0, (timestamp - sessionStart) / 60000);
   const sessions = await getSessions();
   const previousDurations = sessions
     .filter((session) => session.domain === domain)
@@ -625,6 +646,7 @@ async function buildSummary() {
   const { dailyUsage, trackedDays } = await getDailyUsage();
   const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
   const currentDomain = await getCurrentTrackedDomain();
+  // Prefer the actively-tracked domain; fall back to what's in the tab right now
   const domain = activeSession?.domain || currentDomain || null;
   const today = domain ? Number(dailyUsage[dateKey]?.[domain] || 0) : 0;
   const trackedToday = totalMinutesForDate(dailyUsage, dateKey);
@@ -766,5 +788,3 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return true;
 });
-
-
