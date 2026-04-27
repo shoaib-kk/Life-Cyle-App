@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LifeCycle</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="popup">
+      <header class="header">
+        <h1>LifeCycle</h1>
+        <p id="domain">Today</p>
+      </header>
+
+      <dl class="summary">
+        <div class="row">
+          <dt>Today</dt>
+          <dd id="today">0 min</dd>
+        </div>
+        <div class="row">
+          <dt>Avg</dt>
+          <dd id="average">0 min</dd>
+        </div>
+        <div class="row">
+          <dt>Status</dt>
+          <dd id="status">No usage yet</dd>
+        </div>
+        <div class="row">
+          <dt>Prediction</dt>
+          <dd id="prediction">~0 min today</dd>
+        </div>
+      </dl>
+
+      <p id="recommendation" class="recommendation">No active usage recorded yet today</p>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
