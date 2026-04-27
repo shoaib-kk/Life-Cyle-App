@@ -1,4 +1,5 @@
-﻿const BACKEND_URL = "http://127.0.0.1:8000";
+﻿console.log("LifeCycle background loaded");
+const BACKEND_URL = "http://127.0.0.1:8000";
 const BASELINE_WEEKDAY_OCCURRENCES = 8;
 const FULL_DAY_MINUTES = 24 * 60;
 const ABOVE_BASELINE_THRESHOLD = 0.3;
@@ -479,6 +480,7 @@ async function resumeTrackingIfActive() {
 
 async function startSessionForTab(tab, timestamp = Date.now()) {
   const domain = tab?.url ? normalizeDomain(tab.url) : null;
+  console.log("Starting session for:", domain);
   const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
   const settings = await getSettings();
 
@@ -539,6 +541,7 @@ async function refreshActiveContext() {
   await checkpointActiveSession(timestamp);
 
   const activeTab = await getFocusedActiveTab();
+  console.log("Active tab:", activeTab?.url);
   const newDomain = activeTab?.url ? normalizeDomain(activeTab.url) : null;
   const { activeSession = null } = await chrome.storage.local.get({ activeSession: null });
 
