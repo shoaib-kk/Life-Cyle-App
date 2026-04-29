@@ -8,13 +8,67 @@
 </head>
 <body>
 
-  <!-- TOP BAR: active domain + status badge -->
+  <!-- TOP BAR: active domain + status badge + gear -->
   <div class="top-bar" id="top-bar">
     <div class="domain-row">
       <div class="favicon" id="favicon"></div>
       <span class="domain-name" id="domain-name">No active tab</span>
     </div>
-    <span class="badge" id="status-badge"></span>
+    <div class="top-bar-right">
+      <span class="badge" id="status-badge"></span>
+      <button class="gear-btn" id="gear-btn" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z" fill="currentColor"/>
+          <path fill-rule="evenodd" clip-rule="evenodd" d="M6.56 1.31a.75.75 0 0 1 .73-.56h1.42c.34 0 .63.23.72.55l.28 1.02c.3.1.59.23.86.39l.97-.44a.75.75 0 0 1 .88.17l1 1a.75.75 0 0 1 .14.88l-.46.96c.16.27.29.55.39.85l1.02.28c.32.09.55.38.55.72v1.42a.75.75 0 0 1-.56.73l-1.02.28a4.73 4.73 0 0 1-.39.86l.44.97a.75.75 0 0 1-.17.88l-1 1a.75.75 0 0 1-.88.14l-.96-.46c-.27.16-.55.29-.85.39l-.28 1.02a.75.75 0 0 1-.72.55H7.27a.75.75 0 0 1-.73-.56l-.28-1.02a4.73 4.73 0 0 1-.86-.39l-.97.44a.75.75 0 0 1-.88-.17l-1-1a.75.75 0 0 1-.14-.88l.46-.96a4.73 4.73 0 0 1-.39-.85L1.46 9.4A.75.75 0 0 1 .91 8.7V7.27a.75.75 0 0 1 .56-.73l1.02-.28c.1-.3.23-.59.39-.86l-.44-.97a.75.75 0 0 1 .17-.88l1-1a.75.75 0 0 1 .88-.14l.96.46c.27-.16.55-.29.85-.39L6.56 1.3ZM8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z" fill="currentColor" opacity="0.4"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- SETTINGS PANEL (hidden by default) -->
+  <div class="settings-panel" id="settings-panel">
+    <div class="settings-heading">Theme</div>
+    <div class="theme-grid">
+      <label class="theme-swatch">
+        <input type="radio" name="theme" value="default" checked />
+        <div class="swatch-circle swatch-default"></div>
+        <span class="swatch-label">Default</span>
+      </label>
+      <label class="theme-swatch">
+        <input type="radio" name="theme" value="dark" />
+        <div class="swatch-circle swatch-dark"></div>
+        <span class="swatch-label">Dark</span>
+      </label>
+      <label class="theme-swatch">
+        <input type="radio" name="theme" value="forest" />
+        <div class="swatch-circle swatch-forest"></div>
+        <span class="swatch-label">Forest</span>
+      </label>
+      <label class="theme-swatch">
+        <input type="radio" name="theme" value="dusk" />
+        <div class="swatch-circle swatch-dusk"></div>
+        <span class="swatch-label">Dusk</span>
+      </label>
+      <label class="theme-swatch">
+        <input type="radio" name="theme" value="sand" />
+        <div class="swatch-circle swatch-sand"></div>
+        <span class="swatch-label">Sand</span>
+      </label>
+    </div>
+    <div class="settings-divider"></div>
+    <div class="settings-row">
+      <span class="settings-row-label">Daily reset at</span>
+      <select id="reset-select">
+        <option value="midnight">Midnight</option>
+        <option value="3am">3 am</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- TOTAL SCREEN TIME BANNER -->
+  <div class="total-bar">
+    <span class="total-label">Total screen time today</span>
+    <span class="total-value" id="total-screen-time">—</span>
   </div>
 
   <!-- STAT GRID: today / avg / predicted -->
@@ -54,15 +108,8 @@
     <div class="sites-list" id="sites-list"></div>
   </div>
 
-  <!-- FOOTER: reset setting + confidence -->
+  <!-- FOOTER: confidence -->
   <div class="footer">
-    <div class="reset-row">
-      <span class="footer-label">Reset at</span>
-      <select id="reset-select">
-        <option value="midnight">Midnight</option>
-        <option value="3am">3 am</option>
-      </select>
-    </div>
     <div class="confidence-row" id="confidence-row"></div>
   </div>
 

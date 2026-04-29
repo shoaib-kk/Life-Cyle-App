@@ -29,25 +29,65 @@ function clamp(val, min, max) {
 
 const $ = id => document.getElementById(id);
 
-const domFavicon        = $("favicon");
-const domDomainName     = $("domain-name");
-const domStatusBadge    = $("status-badge");
-const domStatToday      = $("stat-today");
-const domStatAvg        = $("stat-avg");
-const domStatAvgLbl     = $("stat-avg-lbl");
-const domStatPredicted  = $("stat-predicted");
-const domSessionSection = $("session-section");
-const domSessionMeta    = $("session-meta");
-const domSessionFill    = $("session-fill");
-const domSessionCaption = $("session-caption");
-const domRecommendation = $("recommendation");
-const domSitesList      = $("sites-list");
-const domConfidence     = $("confidence-row");
-const domResetSelect    = $("reset-select");
+const domFavicon         = $("favicon");
+const domDomainName      = $("domain-name");
+const domStatusBadge     = $("status-badge");
+const domStatToday       = $("stat-today");
+const domStatAvg         = $("stat-avg");
+const domStatAvgLbl      = $("stat-avg-lbl");
+const domStatPredicted   = $("stat-predicted");
+const domSessionSection  = $("session-section");
+const domSessionMeta     = $("session-meta");
+const domSessionFill     = $("session-fill");
+const domSessionCaption  = $("session-caption");
+const domRecommendation  = $("recommendation");
+const domSitesList       = $("sites-list");
+const domConfidence      = $("confidence-row");
+const domResetSelect     = $("reset-select");
+const domTotalScreenTime = $("total-screen-time");
+const domGearBtn         = $("gear-btn");
+const domSettingsPanel   = $("settings-panel");
+
+/* ── Theme ───────────────────────────────── */
+
+const THEMES = ["default", "dark", "forest", "dusk", "sand"];
+
+function applyTheme(theme) {
+  if (!THEMES.includes(theme)) theme = "default";
+  document.documentElement.setAttribute("data-theme", theme);
+  // sync the radio buttons
+  document.querySelectorAll('input[name="theme"]').forEach(radio => {
+    radio.checked = radio.value === theme;
+  });
+}
+
+function loadTheme() {
+  chrome.storage.local.get({ uiTheme: "default" }, ({ uiTheme }) => {
+    applyTheme(uiTheme);
+  });
+}
+
+function saveTheme(theme) {
+  applyTheme(theme);
+  chrome.storage.local.set({ uiTheme: theme });
+}
+
+loadTheme();
+
+document.querySelectorAll('input[name="theme"]').forEach(radio => {
+  radio.addEventListener("change", () => {
+    if (radio.checked) saveTheme(radio.value);
+  });
+});
+
+/* ── Settings panel toggle ───────────────── */
+
+domGearBtn.addEventListener("click", () => {
+  domSettingsPanel.classList.toggle("open");
+});
 
 /* ── Reset setting ───────────────────────── */
 
-// Load saved reset hour and map 0→midnight, 3→3am
 chrome.storage.local.get({ settings: {} }, ({ settings }) => {
   domResetSelect.value = settings.dailyResetHour === 3 ? "3am" : "midnight";
 });
@@ -63,7 +103,6 @@ domResetSelect.addEventListener("change", () => {
 /* ── Confidence dots ─────────────────────── */
 
 function renderConfidence(label) {
-  // label: "Low confidence", "Medium confidence", "High confidence", or "-"/null
   const filled =
     label === "High confidence" ? 4 :
     label === "Medium confidence" ? 3 :
@@ -147,24 +186,7 @@ function renderSites(usageToday, activeDomain) {
   }).join("");
 }
 
-/* ── Map background summary → UI ─────────── */
-
-/*
-  buildSummary() (from background.js) returns a flat object. Key fields:
-    domain                  – active/current domain (string | null)
-    usage                   – { [domain]: minutes } for today
-    averageMinutes          – baseline avg for the active domain (number | "-")
-    status                  – e.g. "+18% above normal" | "On your normal pace"
-    prediction              – e.g. "Prediction: ~42 min today"
-    recommendation          – advice string
-    todayMinutes            – minutes on active domain today
-    currentSessionMinutes   – current session length (number | "-")
-    typicalSessionMinutes   – median past session (number | "-")
-    sessionPercentile       – 0-100 | null
-    sessionStatus           – "Active" | "Paused" | "No active tab" | …
-    baselineConfidence      – "High confidence" | "Medium confidence" | "Low confidence" | "-"
-    elapsedMinutesToday     – minutes since midnight/reset (number)
-*/
+/* ── Main render ─────────────────────────── */
 
 function render(raw) {
   if (!raw) return;
@@ -172,6 +194,10 @@ function render(raw) {
   const domain = raw.domain || null;
   const usageToday = raw.usage || {};
   const domainMins = domain ? Number(usageToday[domain] || 0) : null;
+
+  /* ── Total screen time ── */
+  const totalMins = Object.values(usageToday).reduce((sum, m) => sum + Number(m || 0), 0);
+  domTotalScreenTime.textContent = totalMins > 0 ? fmt(totalMins) : "—";
 
   /* ── Top bar ── */
   setFavicon(domain);
@@ -209,7 +235,6 @@ function render(raw) {
     domStatAvgLbl.textContent = "Avg";
   }
 
-  // Extract the predicted minutes from e.g. "Prediction: ~42 min today"
   const predStr = raw.prediction || "";
   const predMatch = predStr.match(/~(\d+)/);
   domStatPredicted.textContent = predMatch ? "~" + fmt(Number(predMatch[1])) : "—";
