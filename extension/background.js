@@ -611,20 +611,39 @@ async function checkpointActiveSession(timestamp = Date.now()) {
 }
 
 async function getFocusSnapshot() {
-  const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+  // Include popup window type so we can detect when the extension popup is
+  // the focused window and avoid misidentifying it as a lost-focus event.
+  const windows = await chrome.windows.getAll({ windowTypes: ["normal", "popup"] });
   const focusedWindow = windows.find((w) => w.focused) || null;
-  let activeTab = null;
 
-  if (focusedWindow) {
+  // If the focused window is the extension popup itself, treat it as
+  // transparent — find the most-recently-focused normal browser window
+  // instead, so we don't end the active session just because the user
+  // opened the popup.
+  const isExtensionPopup =
+    focusedWindow?.type === "popup" &&
+    focusedWindow?.id !== chrome.windows.WINDOW_ID_NONE;
+
+  let trackingWindow = focusedWindow;
+  if (isExtensionPopup) {
+    const normalWindows = windows.filter((w) => w.type === "normal");
+    // Fall back to the last normal window; Chrome orders by recency descending.
+    trackingWindow = normalWindows[0] || null;
+  }
+
+  let activeTab = null;
+  if (trackingWindow) {
     const [tab] = await chrome.tabs.query({
       active: true,
-      windowId: focusedWindow.id
+      windowId: trackingWindow.id
     });
     activeTab = tab || null;
   }
 
   return {
-    focusedWindow,
+    // Expose whether the popup is currently open — useful for callers.
+    isExtensionPopupFocused: isExtensionPopup,
+    focusedWindow: trackingWindow,
     activeTab,
     currentDomain: activeTab?.url ? normalizeDomain(activeTab.url) : null
   };
@@ -803,7 +822,15 @@ async function refreshActiveContext() {
   const timestamp = Date.now();
   const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
   const { trackingPaused, excludedDomains } = await getAppState();
-  const { focusedWindow, activeTab, currentDomain: newDomain } = await getFocusSnapshot();
+  const { isExtensionPopupFocused, focusedWindow, activeTab, currentDomain: newDomain } = await getFocusSnapshot();
+
+  // The user opened the extension popup. This is not a real focus change —
+  // the underlying browser tab is still active. Skip this cycle entirely so
+  // we don't end the session or clear currentUsage.
+  if (isExtensionPopupFocused) {
+    await updateBadge();
+    return;
+  }
 
   if (trackingPaused) {
     await updateCurrentUsage(null, null, timestamp);
@@ -1181,8 +1208,16 @@ async function buildSummary() {
     domainCategories
   } = await getAppState();
   const focusSnapshot = await getFocusSnapshot();
-  const currentDomain = focusSnapshot.currentDomain;
-  // Prefer the actively-tracked domain; fall back to what's in the tab right now
+
+  // Bug 3 fix: when the popup itself is focused, getFocusSnapshot returns the
+  // underlying normal-window tab — but if that lookup still yields null (e.g.
+  // all windows minimised), prefer the in-memory activeSession domain so the
+  // popup always shows the session that was running before it was opened.
+  const currentDomain = focusSnapshot.isExtensionPopupFocused
+    ? (activeSession?.domain || focusSnapshot.currentDomain || null)
+    : focusSnapshot.currentDomain;
+
+  // Prefer the actively-tracked domain; fall back to what's in the tab right now.
   const domain = activeSession?.domain || currentDomain || null;
   const usageToday = dailyUsage[dateKey] || {};
   const today = domain ? Number(dailyUsage[dateKey]?.[domain] || 0) : 0;
@@ -1431,8 +1466,15 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-chrome.tabs.onActivated.addListener(() => {
-  enqueue(refreshActiveContext);
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  // Ignore activation of the extension popup tab itself — querying it would
+  // return a chrome-extension:// URL, which normalizeDomain maps to null,
+  // which then triggers pauseTrackingForIdle and kills the active session.
+  chrome.tabs.get(tabId, (tab) => {
+    if (chrome.runtime.lastError) return;
+    if (tab?.url?.startsWith("chrome-extension://")) return;
+    enqueue(refreshActiveContext);
+  });
 });
 
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
@@ -1441,7 +1483,11 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   }
 });
 
-chrome.windows.onFocusChanged.addListener(() => {
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  // WINDOW_ID_NONE fires briefly as the popup opens — ignore it.
+  // We also skip via refreshActiveContext's isExtensionPopupFocused guard,
+  // but catching it early here avoids an unnecessary enqueue + storage read.
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
   enqueue(refreshActiveContext);
 });
 
