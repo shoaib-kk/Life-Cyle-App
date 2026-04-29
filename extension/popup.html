@@ -1,146 +1,71 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>LifeCycle</title>
-    <link rel="stylesheet" href="popup.css">
-  </head>
-  <body>
-    <main class="popup">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LifeCycle</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
 
-      <!-- Header -->
-      <header class="header">
-        <div class="header-brand">
-          <span class="brand-dot"></span>
-          <h1>LifeCycle</h1>
-        </div>
-        <button id="settingsToggle" class="icon-btn" aria-label="Settings" aria-expanded="false">
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <circle cx="8" cy="8" r="2.5" stroke="currentColor" stroke-width="1.5"/>
-            <path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M2.93 2.93l1.06 1.06M12.01 12.01l1.06 1.06M2.93 13.07l1.06-1.06M12.01 3.99l1.06-1.06" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-          </svg>
-        </button>
-      </header>
+  <!-- TOP BAR: active domain + status badge -->
+  <div class="top-bar" id="top-bar">
+    <div class="domain-row">
+      <div class="favicon" id="favicon"></div>
+      <span class="domain-name" id="domain-name">No active tab</span>
+    </div>
+    <span class="badge" id="status-badge"></span>
+  </div>
 
-      <!-- Tab nav -->
-      <nav class="tab-nav" role="tablist">
-        <button class="tab active" role="tab" aria-selected="true" data-tab="now">Now</button>
-        <button class="tab" role="tab" aria-selected="false" data-tab="today">Today</button>
-        <button class="tab" role="tab" aria-selected="false" data-tab="week">Week</button>
-      </nav>
+  <!-- STAT GRID: today / avg / predicted -->
+  <div class="stat-grid">
+    <div class="stat-cell">
+      <div class="stat-num" id="stat-today">—</div>
+      <div class="stat-lbl">Today</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-num" id="stat-avg">—</div>
+      <div class="stat-lbl" id="stat-avg-lbl">Avg</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-num" id="stat-predicted">—</div>
+      <div class="stat-lbl">Predicted</div>
+    </div>
+  </div>
 
-      <!-- NOW view -->
-      <section id="view-now" class="view active" aria-label="Current session">
+  <!-- SESSION BAR -->
+  <div class="session-section" id="session-section">
+    <div class="session-header">
+      <span class="section-title">Current session</span>
+      <span class="session-meta" id="session-meta"></span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="session-fill"></div>
+    </div>
+    <div class="session-caption" id="session-caption"></div>
+  </div>
 
-        <div class="now-hero">
-          <div class="now-domain-row">
-            <span class="live-dot" id="liveDot"></span>
-            <span class="now-domain" id="nowDomain">No active tab</span>
-          </div>
-          <div class="now-time" id="nowTime">—</div>
-          <div class="now-sub" id="nowSub"></div>
-        </div>
+  <!-- RECOMMENDATION -->
+  <div class="recommendation" id="recommendation"></div>
 
-        <div class="signal-bar" id="signalBar">
-          <div class="signal-fill" id="signalFill"></div>
-        </div>
+  <!-- SITES LIST -->
+  <div class="sites-section">
+    <div class="section-title" style="padding: 10px 14px 6px;">Today's sites</div>
+    <div class="sites-list" id="sites-list"></div>
+  </div>
 
-        <p class="now-insight" id="nowInsight"></p>
+  <!-- FOOTER: reset setting + confidence -->
+  <div class="footer">
+    <div class="reset-row">
+      <span class="footer-label">Reset at</span>
+      <select id="reset-select">
+        <option value="midnight">Midnight</option>
+        <option value="3am">3 am</option>
+      </select>
+    </div>
+    <div class="confidence-row" id="confidence-row"></div>
+  </div>
 
-      </section>
-
-      <!-- TODAY view -->
-      <section id="view-today" class="view" aria-label="Today's summary" hidden>
-
-        <div class="today-hero">
-          <div>
-            <div class="metric-label">Total today</div>
-            <div class="metric-value" id="todayTotal">—</div>
-          </div>
-          <div class="today-vs">
-            <div class="metric-label">Avg this weekday</div>
-            <div class="metric-value muted" id="todayAvg">—</div>
-          </div>
-        </div>
-
-        <div class="status-chip-row">
-          <span class="status-chip" id="todayStatus">—</span>
-          <span class="status-chip muted" id="todayPrediction">—</span>
-        </div>
-
-        <div class="site-list" id="todaySiteList"></div>
-
-        <p class="today-insight" id="todayInsight"></p>
-
-      </section>
-
-      <!-- WEEK view -->
-      <section id="view-week" class="view" aria-label="Weekly trends" hidden>
-
-        <div class="week-chart" id="weekChart"></div>
-
-        <div class="week-stats">
-          <div class="week-stat">
-            <span class="metric-label">Productive</span>
-            <strong id="weekProductive">0%</strong>
-          </div>
-          <div class="week-stat">
-            <span class="metric-label">Distracting</span>
-            <strong id="weekDistracting">0%</strong>
-          </div>
-          <div class="week-stat">
-            <span class="metric-label">Avg session</span>
-            <strong id="weekAvgSession">—</strong>
-          </div>
-          <div class="week-stat">
-            <span class="metric-label">Tab switches</span>
-            <strong id="weekSwitches">—</strong>
-          </div>
-        </div>
-
-        <div class="week-top-sites" id="weekTopSites"></div>
-
-      </section>
-
-      <!-- SETTINGS overlay -->
-      <section id="settingsPanel" class="settings-panel" hidden aria-label="Settings">
-
-        <div class="settings-group">
-          <label class="settings-label" for="resetTime">Daily reset</label>
-          <select id="resetTime" class="settings-select" aria-label="Daily reset time">
-            <option value="0">Midnight (12 am)</option>
-            <option value="3">3 am</option>
-          </select>
-        </div>
-
-        <div class="settings-group">
-          <label class="settings-label" for="categorySelect">Current site category</label>
-          <select id="categorySelect" class="settings-select" aria-label="Current site category">
-            <option value="productive">Productive</option>
-            <option value="distracting">Distracting</option>
-            <option value="neutral">Neutral</option>
-          </select>
-        </div>
-
-        <div class="settings-actions">
-          <button id="pauseTracking" class="action-btn" type="button">Pause tracking</button>
-          <button id="resumeTracking" class="action-btn" type="button">Resume tracking</button>
-          <button id="excludeCurrentSite" class="action-btn" type="button">Exclude this site</button>
-          <button id="resetToday" class="action-btn" type="button">Reset today</button>
-        </div>
-
-        <button id="clearAllData" class="danger-btn" type="button">Clear all data</button>
-
-        <!-- Debug -->
-        <details class="debug-details">
-          <summary class="debug-summary">Debug</summary>
-          <dl id="debugPanel" class="debug-panel"></dl>
-        </details>
-
-      </section>
-
-    </main>
-    <script src="popup.js"></script>
-  </body>
+  <script src="popup.js"></script>
+</body>
 </html>
