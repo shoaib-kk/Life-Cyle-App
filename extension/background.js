@@ -878,21 +878,21 @@ async function refreshActiveContext() {
 
   // ── Alerts: notifications + in-page overlay ───────────────────────────────
   try {
-    const alertSettings = await getSettings();
-    const alertDateKey = localDateKey(timestamp, alertSettings.dailyResetHour);
+    const coreSettings = await getSettings();
+    const alertDateKey = localDateKey(timestamp, coreSettings.dailyResetHour);
     const { dailyUsage: alertUsage, trackedDays: alertTracked } = await getDailyUsage();
     const alertUsageToday = alertUsage[alertDateKey] || {};
     const alertDomainMins = newDomain ? Number(alertUsageToday[newDomain] || 0) : 0;
     const { baseline: alertBaseline, recordCount: alertCount } = baselineForDomain(
       alertUsage, alertTracked, alertDateKey, newDomain,
-      BASELINE_WEEKDAY_OCCURRENCES, alertSettings.dailyResetHour
+      BASELINE_WEEKDAY_OCCURRENCES, coreSettings.dailyResetHour
     );
     const alertAvg = alertCount >= MIN_BASELINE_RECORDS ? alertBaseline : 0;
     const alertSession = await buildCurrentSessionInsight(newDomain, timestamp);
 
-    const { alertSettings = {} } = await chrome.storage.local.get({ alertSettings: {} });
-    const notifEnabled   = alertSettings.notificationsEnabled !== false;
-    const overlayEnabled = alertSettings.overlayEnabled !== false;
+    const { alertSettings: userAlertSettings = {} } = await chrome.storage.local.get({ alertSettings: {} });
+    const notifEnabled   = userAlertSettings.notificationsEnabled !== false;
+    const overlayEnabled = userAlertSettings.overlayEnabled !== false;
 
     if (notifEnabled) {
       await maybeNotify(newDomain, alertDomainMins, alertAvg, null);
