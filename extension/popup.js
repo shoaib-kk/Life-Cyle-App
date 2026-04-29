@@ -9,17 +9,12 @@
 /* ── Helpers ─────────────────────────────── */
 
 function fmt(minutes) {
-  if (minutes == null || isNaN(minutes)) return "—";
-  const m = Math.round(minutes);
+  if (minutes == null || isNaN(minutes) || minutes === "-") return "—";
+  const m = Math.round(Number(minutes));
   if (m < 60) return m + "m";
   const h = Math.floor(m / 60);
   const rem = m % 60;
   return rem === 0 ? h + "h" : h + "h " + rem + "m";
-}
-
-function today() {
-  const d = new Date();
-  return d.toISOString().slice(0, 10);
 }
 
 function weekdayName(date) {
@@ -34,39 +29,46 @@ function clamp(val, min, max) {
 
 const $ = id => document.getElementById(id);
 
-const domFavicon       = $("favicon");
-const domDomainName    = $("domain-name");
-const domStatusBadge   = $("status-badge");
-const domStatToday     = $("stat-today");
-const domStatAvg       = $("stat-avg");
-const domStatAvgLbl    = $("stat-avg-lbl");
-const domStatPredicted = $("stat-predicted");
-const domSessionSection= $("session-section");
-const domSessionMeta   = $("session-meta");
-const domSessionFill   = $("session-fill");
-const domSessionCaption= $("session-caption");
-const domRecommendation= $("recommendation");
-const domSitesList     = $("sites-list");
-const domConfidence    = $("confidence-row");
-const domResetSelect   = $("reset-select");
+const domFavicon        = $("favicon");
+const domDomainName     = $("domain-name");
+const domStatusBadge    = $("status-badge");
+const domStatToday      = $("stat-today");
+const domStatAvg        = $("stat-avg");
+const domStatAvgLbl     = $("stat-avg-lbl");
+const domStatPredicted  = $("stat-predicted");
+const domSessionSection = $("session-section");
+const domSessionMeta    = $("session-meta");
+const domSessionFill    = $("session-fill");
+const domSessionCaption = $("session-caption");
+const domRecommendation = $("recommendation");
+const domSitesList      = $("sites-list");
+const domConfidence     = $("confidence-row");
+const domResetSelect    = $("reset-select");
 
 /* ── Reset setting ───────────────────────── */
 
-chrome.storage.local.get("resetTime", ({ resetTime }) => {
-  domResetSelect.value = resetTime || "midnight";
+// Load saved reset hour and map 0→midnight, 3→3am
+chrome.storage.local.get({ settings: {} }, ({ settings }) => {
+  domResetSelect.value = settings.dailyResetHour === 3 ? "3am" : "midnight";
 });
 
 domResetSelect.addEventListener("change", () => {
-  chrome.storage.local.set({ resetTime: domResetSelect.value });
-  // notify background to apply new boundary
-  chrome.runtime.sendMessage({ type: "resetTimeChanged", value: domResetSelect.value });
+  const dailyResetHour = domResetSelect.value === "3am" ? 3 : 0;
+  chrome.runtime.sendMessage({
+    type: "SAVE_SETTINGS",
+    settings: { dailyResetHour }
+  });
 });
 
 /* ── Confidence dots ─────────────────────── */
 
-function renderConfidence(level) {
-  // level: "low" (1-2), "medium" (3-5), "high" (6+), or null
-  const filled = level === "high" ? 4 : level === "medium" ? 3 : level === "low" ? 2 : 0;
+function renderConfidence(label) {
+  // label: "Low confidence", "Medium confidence", "High confidence", or "-"/null
+  const filled =
+    label === "High confidence" ? 4 :
+    label === "Medium confidence" ? 3 :
+    label === "Low confidence" ? 2 : 0;
+
   if (filled === 0) {
     domConfidence.innerHTML = "";
     return;
@@ -90,7 +92,6 @@ function setFavicon(domain) {
   const initials = domain.replace(/^www\./, "").slice(0, 2).toUpperCase();
   domFavicon.textContent = initials;
 
-  // Try to load real favicon via Google's service
   const img = document.createElement("img");
   img.src = `https://www.google.com/s2/favicons?domain=${domain}&sz=32`;
   img.onload = () => {
@@ -115,13 +116,13 @@ function setProgressBar(pct, cls) {
 
 /* ── Sites list ──────────────────────────── */
 
-function renderSites(summary, activeDomain) {
-  if (!summary || !summary.usage || Object.keys(summary.usage).length === 0) {
+function renderSites(usageToday, activeDomain) {
+  if (!usageToday || Object.keys(usageToday).length === 0) {
     domSitesList.innerHTML = '<div class="no-data">No sites tracked today</div>';
     return;
   }
 
-  const sorted = Object.entries(summary.usage)
+  const sorted = Object.entries(usageToday)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5);
 
@@ -146,101 +147,101 @@ function renderSites(summary, activeDomain) {
   }).join("");
 }
 
-/* ── Main render ─────────────────────────── */
+/* ── Map background summary → UI ─────────── */
 
-function render(data) {
-  const {
-    activeDomain,
-    isIdle,
-    sessionStart,
-    summary,        // { usage: {domain: mins}, ...}
-    insight,        // from background/backend: { today, baseline, predicted, delta, status, recommendation, confidence }
-    sessionInsight, // { currentSession, typicalSession, percentile, status }
-  } = data;
+/*
+  buildSummary() (from background.js) returns a flat object. Key fields:
+    domain                  – active/current domain (string | null)
+    usage                   – { [domain]: minutes } for today
+    averageMinutes          – baseline avg for the active domain (number | "-")
+    status                  – e.g. "+18% above normal" | "On your normal pace"
+    prediction              – e.g. "Prediction: ~42 min today"
+    recommendation          – advice string
+    todayMinutes            – minutes on active domain today
+    currentSessionMinutes   – current session length (number | "-")
+    typicalSessionMinutes   – median past session (number | "-")
+    sessionPercentile       – 0-100 | null
+    sessionStatus           – "Active" | "Paused" | "No active tab" | …
+    baselineConfidence      – "High confidence" | "Medium confidence" | "Low confidence" | "-"
+    elapsedMinutesToday     – minutes since midnight/reset (number)
+*/
 
-  const todayKey = today();
-  const todayUsage = summary?.usage || {};
-  const domainMins = activeDomain ? (todayUsage[activeDomain] || 0) : null;
+function render(raw) {
+  if (!raw) return;
+
+  const domain = raw.domain || null;
+  const usageToday = raw.usage || {};
+  const domainMins = domain ? Number(usageToday[domain] || 0) : null;
 
   /* ── Top bar ── */
-  if (activeDomain) {
-    setFavicon(activeDomain);
-    domDomainName.textContent = activeDomain;
-  } else {
-    setFavicon(null);
-    domDomainName.textContent = "No active tab";
-  }
+  setFavicon(domain);
+  domDomainName.textContent = domain || "No active tab";
 
-  /* status badge from insight delta */
-  if (insight && insight.status && activeDomain) {
-    const delta = insight.delta; // e.g. 0.18 = +18%
-    if (delta == null) {
-      setBadge("", "muted");
+  const statusStr = raw.status || "";
+  if (domain && statusStr && statusStr !== "-") {
+    const aboveMatch = statusStr.match(/\+(\d+)%/);
+    const belowMatch = statusStr.match(/(-\d+)%|(\d+)% below/);
+    if (aboveMatch) {
+      setBadge(`+${aboveMatch[1]}% above avg`, "warn");
+    } else if (belowMatch) {
+      const pct = belowMatch[1] || belowMatch[2];
+      setBadge(`${pct}% below avg`, "ok");
+    } else if (statusStr.includes("normal pace") || statusStr === "Baseline ready") {
+      setBadge("On pace", "ok");
     } else {
-      const sign = delta >= 0 ? "+" : "";
-      const pct = Math.round(Math.abs(delta) * 100);
-      if (Math.abs(delta) < 0.05) {
-        setBadge("On pace", "ok");
-      } else if (delta > 0) {
-        setBadge(`+${pct}% above avg`, "warn");
-      } else {
-        setBadge(`${pct}% below avg`, "ok");
-      }
+      setBadge("", "muted");
     }
-  } else if (activeDomain) {
+  } else if (domain) {
     setBadge("", "muted");
   } else {
     setBadge("", "");
   }
 
   /* ── Stat grid ── */
-  domStatToday.textContent = activeDomain ? fmt(domainMins) : "—";
+  domStatToday.textContent = domain ? fmt(domainMins) : "—";
 
-  if (insight && insight.baseline != null) {
-    domStatAvg.textContent = fmt(insight.baseline);
-    const d = new Date();
-    domStatAvgLbl.textContent = "Avg (" + weekdayName(d) + ")";
+  const avgMins = Number(raw.averageMinutes);
+  if (domain && !isNaN(avgMins) && avgMins > 0) {
+    domStatAvg.textContent = fmt(avgMins);
+    domStatAvgLbl.textContent = "Avg (" + weekdayName(new Date()) + ")";
   } else {
     domStatAvg.textContent = "—";
     domStatAvgLbl.textContent = "Avg";
   }
 
-  if (insight && insight.predicted != null) {
-    domStatPredicted.textContent = "~" + fmt(insight.predicted);
-  } else {
-    domStatPredicted.textContent = "—";
-  }
+  // Extract the predicted minutes from e.g. "Prediction: ~42 min today"
+  const predStr = raw.prediction || "";
+  const predMatch = predStr.match(/~(\d+)/);
+  domStatPredicted.textContent = predMatch ? "~" + fmt(Number(predMatch[1])) : "—";
 
   /* ── Session bar ── */
-  if (sessionInsight && activeDomain) {
-    const cur = sessionInsight.currentSession;
-    const typ = sessionInsight.typicalSession;
+  const curRaw = raw.currentSessionMinutes;
+  const typRaw = raw.typicalSessionMinutes;
+  const curNum = (curRaw != null && curRaw !== "-") ? Number(curRaw) : null;
+  const typNum = (typRaw != null && typRaw !== "-") ? Number(typRaw) : null;
 
-    domSessionMeta.textContent = typ != null
-      ? fmt(cur) + " · typical " + fmt(typ)
-      : fmt(cur);
+  if (domain && curNum != null) {
+    domSessionSection.style.display = "";
+    domSessionMeta.textContent = typNum != null
+      ? fmt(curNum) + " · typical " + fmt(typNum)
+      : fmt(curNum);
 
-    if (isIdle) {
+    if (raw.sessionStatus === "Paused") {
       domSessionCaption.textContent = "Paused — idle";
-      setProgressBar(typ != null ? (cur / typ) * 100 : 50, "muted");
-    } else if (typ != null) {
-      const ratio = cur / typ;
+      setProgressBar(typNum != null ? (curNum / typNum) * 100 : 50, "muted");
+    } else if (typNum != null && typNum > 0) {
+      const ratio = curNum / typNum;
       const cls = ratio > 1.3 ? "danger" : ratio > 1 ? "warn" : "ok";
       setProgressBar(Math.min(ratio * 100, 100), cls);
-
-      if (sessionInsight.percentile != null) {
-        const p = Math.round(sessionInsight.percentile * 100);
-        domSessionCaption.textContent = `Longer than ${p}% of your past sessions`;
-      } else {
-        domSessionCaption.textContent = "";
-      }
+      const pctile = raw.sessionPercentile;
+      domSessionCaption.textContent = pctile != null
+        ? `Longer than ${pctile}% of your past sessions`
+        : "";
     } else {
       setProgressBar(50, "muted");
       domSessionCaption.textContent = "Not enough history yet";
     }
-
-    domSessionSection.style.display = "";
-  } else if (!activeDomain) {
+  } else if (!domain) {
     domSessionSection.style.display = "none";
   } else {
     domSessionSection.style.display = "";
@@ -250,24 +251,23 @@ function render(data) {
   }
 
   /* ── Recommendation ── */
-  if (insight && insight.recommendation && activeDomain) {
-    domRecommendation.textContent = insight.recommendation;
-  } else {
-    domRecommendation.textContent = "";
-  }
+  domRecommendation.textContent =
+    (domain && raw.recommendation && raw.recommendation !== "-")
+      ? raw.recommendation
+      : "";
 
   /* ── Sites ── */
-  renderSites(summary, activeDomain);
+  renderSites(usageToday, domain);
 
   /* ── Confidence ── */
-  renderConfidence(insight?.confidence || null);
+  renderConfidence(raw.baselineConfidence || null);
 }
 
 /* ── Poll background every second ───────── */
 
 async function refresh() {
   try {
-    const response = await chrome.runtime.sendMessage({ type: "getState" });
+    const response = await chrome.runtime.sendMessage({ type: "GET_USAGE_SUMMARY" });
     if (response) render(response);
   } catch (e) {
     // background not ready yet — skip
