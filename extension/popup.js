@@ -100,6 +100,28 @@ domResetSelect.addEventListener("change", () => {
   });
 });
 
+/* ── Notification toggle ─────────────────── */
+
+const domNotifToggle   = $("notif-toggle");
+const domOverlayToggle = $("overlay-toggle");
+
+chrome.storage.local.get({ alertSettings: { notificationsEnabled: true, overlayEnabled: true } }, ({ alertSettings }) => {
+  domNotifToggle.checked   = alertSettings.notificationsEnabled !== false;
+  domOverlayToggle.checked = alertSettings.overlayEnabled !== false;
+});
+
+function saveAlertSettings() {
+  chrome.storage.local.set({
+    alertSettings: {
+      notificationsEnabled: domNotifToggle.checked,
+      overlayEnabled: domOverlayToggle.checked
+    }
+  });
+}
+
+domNotifToggle.addEventListener("change", saveAlertSettings);
+domOverlayToggle.addEventListener("change", saveAlertSettings);
+
 /* ── Confidence dots ─────────────────────── */
 
 function renderConfidence(label) {

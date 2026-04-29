@@ -875,6 +875,38 @@ async function refreshActiveContext() {
   await startSessionForTab(activeTab, timestamp);
   await updateBadge();
   await syncTodayToBackend();
+
+  // ── Alerts: notifications + in-page overlay ───────────────────────────────
+  try {
+    const alertSettings = await getSettings();
+    const alertDateKey = localDateKey(timestamp, alertSettings.dailyResetHour);
+    const { dailyUsage: alertUsage, trackedDays: alertTracked } = await getDailyUsage();
+    const alertUsageToday = alertUsage[alertDateKey] || {};
+    const alertDomainMins = newDomain ? Number(alertUsageToday[newDomain] || 0) : 0;
+    const { baseline: alertBaseline, recordCount: alertCount } = baselineForDomain(
+      alertUsage, alertTracked, alertDateKey, newDomain,
+      BASELINE_WEEKDAY_OCCURRENCES, alertSettings.dailyResetHour
+    );
+    const alertAvg = alertCount >= MIN_BASELINE_RECORDS ? alertBaseline : 0;
+    const alertSession = await buildCurrentSessionInsight(newDomain, timestamp);
+
+    const { alertSettings = {} } = await chrome.storage.local.get({ alertSettings: {} });
+    const notifEnabled   = alertSettings.notificationsEnabled !== false;
+    const overlayEnabled = alertSettings.overlayEnabled !== false;
+
+    if (notifEnabled) {
+      await maybeNotify(newDomain, alertDomainMins, alertAvg, null);
+    }
+    if (overlayEnabled && activeTab?.id) {
+      await updateOverlay(
+        activeTab.id, newDomain, alertDomainMins, alertAvg,
+        alertSession.currentSessionMinutes,
+        alertSession.typicalSessionMinutes
+      );
+    }
+  } catch (_alertErr) {
+    // Alerts are non-critical — never break core tracking
+  }
 }
 
 function totalMinutesForDate(dailyUsage, dateKey) {
@@ -1289,6 +1321,15 @@ async function buildSummary() {
   };
 }
 
+// ── Notification + overlay state ──────────────────────────────────────────────
+// Tracks the last time we fired a notification per domain so we don't spam.
+// Key: domain, value: { thresholdKey, firedAt }
+const notificationCooldowns = {};
+// Tracks which tabs already have the overlay shown so we can update/hide it.
+const tabOverlayState = {};   // tabId -> { domain, shown }
+
+// ── Badge ─────────────────────────────────────────────────────────────────────
+
 async function updateBadge() {
   const settings = await getSettings();
   const dateKey = localDateKey(Date.now(), settings.dailyResetHour);
@@ -1296,8 +1337,116 @@ async function updateBadge() {
   const total = displayMinutes(totalMinutesForDate(dailyUsage, dateKey));
   const text = total > 999 ? `${Math.round(total / 60)}h` : String(total);
 
+  // Colour: red if ≥120 min, amber if ≥60 min, blue otherwise
+  const color =
+    total >= 120 ? "#e24b4a" :
+    total >= 60  ? "#ba7517" :
+                   "#1f6feb";
+
   await chrome.action.setBadgeText({ text });
-  await chrome.action.setBadgeBackgroundColor({ color: "#1f6feb" });
+  await chrome.action.setBadgeBackgroundColor({ color });
+}
+
+// ── Alert helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Fire a system notification if the domain has exceeded baseline
+ * and we haven't already notified for this threshold in the last hour.
+ */
+async function maybeNotify(domain, domainMins, averageMinutes, predictedTotal) {
+  if (!domain) return;
+
+  const avg = Number(averageMinutes);
+  if (isNaN(avg) || avg <= 0) return;
+
+  // We only notify at 100% and 150% of baseline, once per threshold per hour.
+  const THRESHOLDS = [
+    { key: "150pct", ratio: 1.5,
+      title: "Way over your usual time",
+      msg: (d, m, a) =>
+        `You've spent ${displayMinutes(m)} min on ${displayDomain(d)} — that's 150% of your ${displayMinutes(a)} min average.`
+    },
+    { key: "100pct", ratio: 1.0,
+      title: "You've hit your baseline",
+      msg: (d, m, a) =>
+        `${displayDomain(d)}: ${displayMinutes(m)} min today — you've reached your usual ${displayMinutes(a)} min.`
+    }
+  ];
+
+  const now = Date.now();
+  const COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+
+  for (const threshold of THRESHOLDS) {
+    if (domainMins < avg * threshold.ratio) continue;
+
+    const key = `${domain}:${threshold.key}`;
+    const prev = notificationCooldowns[key];
+    if (prev && now - prev < COOLDOWN_MS) continue;  // already notified recently
+
+    notificationCooldowns[key] = now;
+
+    chrome.notifications.create(`lifecycle-${key}`, {
+      type: "basic",
+      iconUrl: "icon.png",
+      title: `LifeCycle — ${threshold.title}`,
+      message: threshold.msg(domain, domainMins, avg),
+      priority: 1
+    });
+
+    break;  // only the highest applicable threshold per call
+  }
+}
+
+/**
+ * Send a message to the active tab's content script to show/update/hide
+ * the in-page overlay banner.
+ */
+async function updateOverlay(tabId, domain, domainMins, averageMinutes, sessionMins, typicalSessionMins) {
+  if (!tabId) return;
+
+  const avg = Number(averageMinutes);
+  const aboveBaseline = !isNaN(avg) && avg > 0 && domainMins >= avg;
+
+  const sessionNum = (sessionMins != null && sessionMins !== "-") ? Number(sessionMins) : null;
+  const typNum = (typicalSessionMins != null && typicalSessionMins !== "-") ? Number(typicalSessionMins) : null;
+  const longSession = sessionNum != null && typNum != null && typNum > 0 && sessionNum > typNum;
+
+  if (!domain || (!aboveBaseline && !longSession)) {
+    // Hide the overlay if nothing to warn about
+    if (tabOverlayState[tabId]?.shown) {
+      try {
+        await chrome.tabs.sendMessage(tabId, { type: "LIFECYCLE_OVERLAY_HIDE" });
+      } catch (_) {}
+      tabOverlayState[tabId] = { domain, shown: false };
+    }
+    return;
+  }
+
+  let line1 = "";
+  let line2 = "";
+  let level = "warn"; // "warn" | "danger"
+
+  if (aboveBaseline) {
+    const pct = avg > 0 ? Math.round(((domainMins - avg) / avg) * 100) : 0;
+    line1 = `${displayDomain(domain)}: ${displayMinutes(domainMins)} min today (+${pct}% above avg)`;
+    level = domainMins >= avg * 1.5 ? "danger" : "warn";
+  }
+
+  if (longSession) {
+    const extra = Math.round(sessionNum - typNum);
+    line2 = `Session is ${extra} min over your usual length`;
+    if (!line1) level = "warn";
+  }
+
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "LIFECYCLE_OVERLAY_SHOW",
+      payload: { line1, line2, level }
+    });
+    tabOverlayState[tabId] = { domain, shown: true };
+  } catch (_) {
+    // Content script may not be injected yet — ignore silently
+  }
 }
 
 async function syncTodayToBackend() {
