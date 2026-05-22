@@ -1,4 +1,5 @@
 const BACKEND_URL = "http://127.0.0.1:8000";
+const AUTH_CALLBACK_PATH = "/extension-callback";
 const STORAGE_SCHEMA_VERSION = 1;
 const BASELINE_WEEKDAY_OCCURRENCES = 8;
 const FULL_DAY_MINUTES = 24 * 60;
@@ -523,6 +524,41 @@ async function getDailyUsage() {
 
 async function setDailyUsage(dailyUsage, trackedDays) {
   await chrome.storage.local.set({ dailyUsage, trackedDays });
+}
+
+async function getAuthState() {
+  const {
+    authToken = null,
+    authEmail = null,
+    authUserId = null
+  } = await chrome.storage.local.get({
+    authToken: null,
+    authEmail: null,
+    authUserId: null
+  });
+
+  return { authToken, authEmail, authUserId };
+}
+
+async function getAuthToken() {
+  return (await getAuthState()).authToken;
+}
+
+async function authHeaders() {
+  const token = await getAuthToken();
+
+  if (!token) {
+    return null;
+  }
+
+  return {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${token}`
+  };
+}
+
+async function clearAuthState() {
+  await chrome.storage.local.remove(["authToken", "authEmail", "authUserId"]);
 }
 
 function pruneDailyHistory(dailyUsage, trackedDays, timestamp = Date.now(), resetHour = 0) {
@@ -1601,6 +1637,11 @@ async function updateOverlay(tabId, domain, domainMins, averageMinutes, sessionM
 async function syncTodayToBackend(options = {}) {
   const now = Date.now();
   const force = Boolean(options.force);
+  const headers = await authHeaders();
+
+  if (!headers) {
+    return;
+  }
 
   if (!force && now - lastBackendSyncAt < BACKEND_SYNC_MIN_INTERVAL_MS) {
     return;
@@ -1623,11 +1664,21 @@ async function syncTodayToBackend(options = {}) {
   }
 
   try {
-    await fetch(`${BACKEND_URL}/usage`, {
+    const response = await fetch(`${BACKEND_URL}/usage`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ date: dateKey, usage, tracked: true })
     });
+
+    if (response.status === 401) {
+      await clearAuthState();
+      return;
+    }
+
+    if (!response.ok) {
+      throw new Error(`Backend sync failed with ${response.status}`);
+    }
+
     lastBackendSyncAt = now;
     lastBackendSyncSignature = signature;
   } catch (_error) {
@@ -1638,6 +1689,107 @@ async function syncTodayToBackend(options = {}) {
       console.warn("LifeCycle backend sync failed; local tracking remains active");
     }
   }
+}
+
+async function pullFromBackend() {
+  const headers = await authHeaders();
+
+  if (!headers) {
+    return;
+  }
+
+  try {
+    const response = await fetch(`${BACKEND_URL}/usage/history`, { headers });
+
+    if (response.status === 401) {
+      await clearAuthState();
+      return;
+    }
+
+    if (!response.ok) {
+      throw new Error(`Backend pull failed with ${response.status}`);
+    }
+
+    const { history = {} } = await response.json();
+    const settings = await getSettings();
+    const todayKey = localDateKey(Date.now(), settings.dailyResetHour);
+    const { dailyUsage, trackedDays } = await getDailyUsage();
+
+    for (const [dateKey, usage] of Object.entries(history)) {
+      if (dateKey === todayKey || trackedDays[dateKey]) {
+        continue;
+      }
+
+      dailyUsage[dateKey] = usage;
+      trackedDays[dateKey] = true;
+    }
+
+    pruneDailyHistory(dailyUsage, trackedDays, Date.now(), settings.dailyResetHour);
+    await setDailyUsage(dailyUsage, trackedDays);
+  } catch (_error) {
+    // Server sync is optional; local storage remains the source of truth.
+  }
+}
+
+async function startLoginFlow() {
+  await chrome.tabs.create({ url: `${BACKEND_URL}/login?source=extension` });
+  return getAuthState();
+}
+
+async function signOut() {
+  const headers = await authHeaders();
+
+  if (headers) {
+    try {
+      await fetch(`${BACKEND_URL}/auth/logout`, {
+        method: "POST",
+        headers
+      });
+    } catch (_error) {
+      // Logging out locally is enough for a stateless bearer token.
+    }
+  }
+
+  await clearAuthState();
+  return getAuthState();
+}
+
+async function handleAuthCallback(tabId, rawUrl) {
+  let url;
+
+  try {
+    url = new URL(rawUrl);
+  } catch (_error) {
+    return false;
+  }
+
+  if (url.origin !== BACKEND_URL || url.pathname !== AUTH_CALLBACK_PATH) {
+    return false;
+  }
+
+  const token = url.searchParams.get("token");
+  const email = url.searchParams.get("email");
+  const userId = url.searchParams.get("userId");
+
+  if (!token) {
+    return true;
+  }
+
+  await chrome.storage.local.set({
+    authToken: token,
+    authEmail: email || null,
+    authUserId: userId || null
+  });
+  await pullFromBackend();
+  await syncTodayToBackend({ force: true });
+
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch (_error) {
+    // The tab may already be gone.
+  }
+
+  return true;
 }
 
 async function pauseTrackingManually() {
@@ -1763,6 +1915,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create("lifecycle-checkpoint", { periodInMinutes: 1 });
   enqueue(async () => {
     await migrateStorage();
+    await pullFromBackend();
     await refreshActiveContext();
   });
 });
@@ -1772,6 +1925,7 @@ chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create("lifecycle-checkpoint", { periodInMinutes: 1 });
   enqueue(async () => {
     await migrateStorage();
+    await pullFromBackend();
     await refreshActiveContext();
   });
 });
@@ -1802,9 +1956,25 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
   });
 });
 
-chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
-  if (tab.active && changeInfo.url) {
-    enqueue(refreshActiveContext);
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!changeInfo.url) {
+    return;
+  }
+
+  enqueue(async () => {
+    if (await handleAuthCallback(tabId, changeInfo.url)) {
+      return;
+    }
+
+    if (tab.active) {
+      await refreshActiveContext();
+    }
+  });
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabOverlayState[tabId]) {
+    delete tabOverlayState[tabId];
   }
 });
 
@@ -1839,7 +2009,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     EXCLUDE_CURRENT_SITE: excludeCurrentSite,
     RESET_TODAY: resetTodaysData,
     CLEAR_ALL_DATA: clearAllData,
-    SET_CURRENT_SITE_CATEGORY: async () => setCurrentSiteCategory(message.category)
+    SET_CURRENT_SITE_CATEGORY: async () => setCurrentSiteCategory(message.category),
+    GET_AUTH_STATE: getAuthState,
+    START_LOGIN: startLoginFlow,
+    SIGN_OUT: signOut
   };
 
   const handler = handlers[message?.type];

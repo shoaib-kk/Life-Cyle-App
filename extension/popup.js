@@ -47,6 +47,8 @@ const domResetSelect     = $("reset-select");
 const domTotalScreenTime = $("total-screen-time");
 const domGearBtn         = $("gear-btn");
 const domSettingsPanel   = $("settings-panel");
+const domLoginBtn        = $("login-btn");
+const domSignoutBtn      = $("signout-btn");
 
 /* ── Theme ───────────────────────────────── */
 
@@ -121,6 +123,37 @@ function saveAlertSettings() {
 
 domNotifToggle.addEventListener("change", saveAlertSettings);
 domOverlayToggle.addEventListener("change", saveAlertSettings);
+
+async function refreshAuthState() {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "GET_AUTH_STATE" });
+    const signedIn = Boolean(response?.authToken && response?.authEmail);
+
+    domLoginBtn.textContent = signedIn ? response.authEmail : "Sign in";
+    domLoginBtn.title = signedIn ? response.authEmail : "Sign in";
+    domLoginBtn.classList.toggle("signed-in", signedIn);
+    domSignoutBtn.classList.toggle("visible", signedIn);
+  } catch (_error) {
+    domLoginBtn.textContent = "Sign in";
+    domLoginBtn.classList.remove("signed-in");
+    domSignoutBtn.classList.remove("visible");
+  }
+}
+
+domLoginBtn.addEventListener("click", async () => {
+  const response = await chrome.runtime.sendMessage({ type: "GET_AUTH_STATE" });
+
+  if (response?.authToken) {
+    return;
+  }
+
+  await chrome.runtime.sendMessage({ type: "START_LOGIN" });
+});
+
+domSignoutBtn.addEventListener("click", async () => {
+  await chrome.runtime.sendMessage({ type: "SIGN_OUT" });
+  await refreshAuthState();
+});
 
 /* ── Confidence dots ─────────────────────── */
 
@@ -351,6 +384,7 @@ async function refresh() {
   try {
     const response = await chrome.runtime.sendMessage({ type: "GET_USAGE_SUMMARY" });
     if (response) render(response);
+    await refreshAuthState();
   } catch (e) {
     if (!chrome.runtime?.id || String(e?.message || "").includes("Extension context invalidated")) {
       stopRefresh();
