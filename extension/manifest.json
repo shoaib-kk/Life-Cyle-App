@@ -2,9 +2,9 @@
   "manifest_version": 3,
   "name": "LifeCycle V1",
   "description": "Track active tab time and show one baseline insight.",
-  "version": "1.0.0",
-  "permissions": ["alarms", "idle", "notifications", "scripting", "storage", "tabs", "windows"],
-  "host_permissions": ["http://127.0.0.1:8000/*", "<all_urls>"],
+  "version": "1.0.1",
+  "permissions": ["alarms", "idle", "notifications", "storage", "tabs", "windows"],
+  "host_permissions": ["http://127.0.0.1:8000/*"],
   "background": {
     "service_worker": "background.js"
   },
@@ -17,12 +17,6 @@
       "matches": ["http://*/*", "https://*/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": ["content.js"],
-      "matches": ["<all_urls>"]
     }
   ]
 }

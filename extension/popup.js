@@ -168,6 +168,30 @@ function setBadge(text, cls) {
   domStatusBadge.className = "badge " + (cls || "");
 }
 
+function setStructuredStatusBadge(statusInfo) {
+  if (!statusInfo || statusInfo.label === "-") {
+    setBadge("", "muted");
+    return;
+  }
+
+  if (statusInfo.code === "above" && Number.isFinite(statusInfo.percent)) {
+    setBadge(`+${statusInfo.percent}% above avg`, statusInfo.tone || "warn");
+    return;
+  }
+
+  if (statusInfo.code === "below" && Number.isFinite(statusInfo.percent)) {
+    setBadge(`${statusInfo.percent}% below avg`, statusInfo.tone || "ok");
+    return;
+  }
+
+  if (statusInfo.code === "on_pace" || statusInfo.code === "baseline_ready") {
+    setBadge("On pace", statusInfo.tone || "ok");
+    return;
+  }
+
+  setBadge("", statusInfo.tone || "muted");
+}
+
 /* ── Progress bar ────────────────────────── */
 
 function setProgressBar(pct, cls) {
@@ -225,8 +249,11 @@ function render(raw) {
   setFavicon(domain);
   domDomainName.textContent = domain || "No active tab";
 
+  const statusInfo = raw.statusInfo || null;
   const statusStr = raw.status || "";
-  if (domain && statusStr && statusStr !== "-") {
+  if (domain && statusInfo) {
+    setStructuredStatusBadge(statusInfo);
+  } else if (domain && statusStr && statusStr !== "-") {
     const aboveMatch = statusStr.match(/\+(\d+)%/);
     const belowMatch = statusStr.match(/(-\d+)%|(\d+)% below/);
     if (aboveMatch) {
@@ -259,7 +286,10 @@ function render(raw) {
 
   const predStr = raw.prediction || "";
   const predMatch = predStr.match(/~(\d+)/);
-  domStatPredicted.textContent = predMatch ? "~" + fmt(Number(predMatch[1])) : "—";
+  const predictedTotal = typeof raw.predictedTotal === "number" ? raw.predictedTotal : null;
+  domStatPredicted.textContent = predictedTotal !== null && Number.isFinite(predictedTotal)
+    ? "~" + fmt(predictedTotal)
+    : predMatch ? "~" + fmt(Number(predMatch[1])) : "—";
 
   /* ── Session bar ── */
   const curRaw = raw.currentSessionMinutes;
@@ -313,13 +343,31 @@ function render(raw) {
 /* ── Poll background every second ───────── */
 
 async function refresh() {
+  if (typeof chrome === "undefined" || !chrome.runtime?.id) {
+    stopRefresh();
+    return;
+  }
+
   try {
     const response = await chrome.runtime.sendMessage({ type: "GET_USAGE_SUMMARY" });
     if (response) render(response);
   } catch (e) {
-    // background not ready yet — skip
+    if (!chrome.runtime?.id || String(e?.message || "").includes("Extension context invalidated")) {
+      stopRefresh();
+    }
+  }
+}
+
+let refreshTimer = null;
+
+function stopRefresh() {
+  if (refreshTimer !== null) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
   }
 }
 
 refresh();
-setInterval(refresh, 1000);
+refreshTimer = setInterval(refresh, 1000);
+window.addEventListener("pagehide", stopRefresh);
+window.addEventListener("unload", stopRefresh);

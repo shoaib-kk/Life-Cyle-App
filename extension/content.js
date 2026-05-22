@@ -1,164 +1,221 @@
-/* ─────────────────────────────────────────────
-   LifeCycle content.js — in-page overlay banner
-   Injected into every http/https page.
-   Listens for messages from background.js and
-   shows a non-intrusive banner at the bottom-right.
-───────────────────────────────────────────── */
-
 "use strict";
 
 (function () {
-  const BANNER_ID = "lifecycle-overlay-banner";
+  const HOST_ID = "lifecycle-overlay-host";
+  const DISMISSAL_STORAGE_KEY = "overlayDismissals";
+  const DISMISS_MS = 30 * 60 * 1000;
+  const AUTO_HIDE_MS = 12 * 1000;
 
-  /* ── Build the banner DOM (once) ────────── */
-  function ensureBanner() {
-    let el = document.getElementById(BANNER_ID);
-    if (el) return el;
+  let dismissedUntil = 0;
 
-    el = document.createElement("div");
-    el.id = BANNER_ID;
-
-    Object.assign(el.style, {
-      position: "fixed",
-      bottom: "20px",
-      right: "20px",
-      zIndex: "2147483647",
-      width: "260px",
-      padding: "10px 12px 10px 14px",
-      borderRadius: "10px",
-      fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif",
-      fontSize: "12px",
-      lineHeight: "1.45",
-      boxShadow: "0 4px 16px rgba(0,0,0,0.18)",
-      display: "flex",
-      alignItems: "flex-start",
-      gap: "10px",
-      transition: "opacity 0.25s ease, transform 0.25s ease",
-      opacity: "0",
-      transform: "translateY(8px)",
-      pointerEvents: "auto",
-      cursor: "default",
-    });
-
-    // Icon
-    const icon = document.createElement("div");
-    Object.assign(icon.style, {
-      width: "18px",
-      height: "18px",
-      flexShrink: "0",
-      marginTop: "1px",
-      borderRadius: "50%",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      fontWeight: "700",
-      fontSize: "11px",
-    });
-    icon.textContent = "⏱";
-    el.appendChild(icon);
-
-    // Text container
-    const textWrap = document.createElement("div");
-    textWrap.style.flex = "1";
-    textWrap.style.minWidth = "0";
-
-    const label = document.createElement("div");
-    label.id = BANNER_ID + "-label";
-    label.style.fontWeight = "600";
-    label.style.marginBottom = "2px";
-    label.textContent = "LifeCycle";
-
-    const body = document.createElement("div");
-    body.id = BANNER_ID + "-body";
-    body.style.opacity = "0.85";
-
-    textWrap.appendChild(label);
-    textWrap.appendChild(body);
-    el.appendChild(textWrap);
-
-    // Dismiss button
-    const dismiss = document.createElement("button");
-    Object.assign(dismiss.style, {
-      border: "none",
-      background: "transparent",
-      cursor: "pointer",
-      padding: "0",
-      fontSize: "14px",
-      lineHeight: "1",
-      opacity: "0.5",
-      flexShrink: "0",
-      marginTop: "1px",
-    });
-    dismiss.textContent = "✕";
-    dismiss.title = "Dismiss";
-    dismiss.addEventListener("click", () => hideBanner(true));
-    el.appendChild(dismiss);
-
-    document.documentElement.appendChild(el);
-    return el;
+  function hostKey() {
+    return location.hostname.toLowerCase().replace(/^www\./, "");
   }
 
-  let dismissedUntil = 0;  // timestamp — user manually dismissed
+  async function loadDismissal() {
+    try {
+      const { [DISMISSAL_STORAGE_KEY]: dismissals = {} } = await chrome.storage.local.get({
+        [DISMISSAL_STORAGE_KEY]: {}
+      });
+      dismissedUntil = Number(dismissals[hostKey()] || 0);
+    } catch (_error) {
+      dismissedUntil = 0;
+    }
+  }
 
-  function showBanner({ line1, line2, level }) {
-    if (Date.now() < dismissedUntil) return;  // respect manual dismissal
+  async function saveDismissal(until) {
+    dismissedUntil = until;
 
-    const el = ensureBanner();
-    const bodyEl = document.getElementById(BANNER_ID + "-body");
+    try {
+      const { [DISMISSAL_STORAGE_KEY]: dismissals = {} } = await chrome.storage.local.get({
+        [DISMISSAL_STORAGE_KEY]: {}
+      });
+      await chrome.storage.local.set({
+        [DISMISSAL_STORAGE_KEY]: {
+          ...dismissals,
+          [hostKey()]: until
+        }
+      });
+    } catch (_error) {
+      // The in-memory value still suppresses repeated banners on this page.
+    }
+  }
 
-    // Colours per level
+  function ensureBanner() {
+    let host = document.getElementById(HOST_ID);
+
+    if (!host) {
+      host = document.createElement("div");
+      host.id = HOST_ID;
+      Object.assign(host.style, {
+        all: "initial",
+        position: "fixed",
+        right: "20px",
+        bottom: "20px",
+        zIndex: "2147483647",
+        display: "none",
+        pointerEvents: "auto"
+      });
+      document.documentElement.appendChild(host);
+    }
+
+    if (!host.shadowRoot) {
+      const root = host.attachShadow({ mode: "open" });
+      root.innerHTML = `
+        <style>
+          :host {
+            all: initial;
+          }
+
+          .banner {
+            width: 260px;
+            box-sizing: border-box;
+            padding: 10px 12px 10px 14px;
+            border-radius: 10px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+            font-size: 12px;
+            line-height: 1.45;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            opacity: 0;
+            transform: translateY(8px);
+            transition: opacity 0.25s ease, transform 0.25s ease;
+            cursor: default;
+          }
+
+          .icon {
+            width: 18px;
+            height: 18px;
+            flex-shrink: 0;
+            margin-top: 1px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 11px;
+          }
+
+          .copy {
+            flex: 1;
+            min-width: 0;
+          }
+
+          .label {
+            font-weight: 600;
+            margin-bottom: 2px;
+          }
+
+          .body {
+            opacity: 0.85;
+          }
+
+          button {
+            border: 0;
+            background: transparent;
+            color: inherit;
+            cursor: pointer;
+            padding: 0;
+            font: inherit;
+            font-size: 14px;
+            line-height: 1;
+            opacity: 0.5;
+            flex-shrink: 0;
+            margin-top: 1px;
+          }
+
+          button:hover {
+            opacity: 0.9;
+          }
+        </style>
+        <div class="banner" part="banner">
+          <div class="icon" aria-hidden="true">!</div>
+          <div class="copy">
+            <div class="label">LifeCycle</div>
+            <div class="body"></div>
+          </div>
+          <button type="button" title="Dismiss" aria-label="Dismiss">x</button>
+        </div>
+      `;
+      root.querySelector("button").addEventListener("click", () => hideBanner(true));
+    }
+
+    return {
+      host,
+      banner: host.shadowRoot.querySelector(".banner"),
+      body: host.shadowRoot.querySelector(".body"),
+      icon: host.shadowRoot.querySelector(".icon")
+    };
+  }
+
+  async function showBanner({ line1, line2, level } = {}) {
+    if (!dismissedUntil) {
+      await loadDismissal();
+    }
+
+    if (Date.now() < dismissedUntil) {
+      return;
+    }
+
+    const { host, banner, body, icon } = ensureBanner();
     const palette = {
       warn: {
         bg: "#faeeda",
         text: "#854f0b",
-        border: "1px solid rgba(186,117,23,0.3)",
-        iconColor: "#ba7517",
+        border: "1px solid rgba(186, 117, 23, 0.3)",
+        iconColor: "#ba7517"
       },
       danger: {
         bg: "#fcebeb",
         text: "#a32d2d",
-        border: "1px solid rgba(226,75,74,0.3)",
-        iconColor: "#e24b4a",
-      },
+        border: "1px solid rgba(226, 75, 74, 0.3)",
+        iconColor: "#e24b4a"
+      }
     };
-
-    const p = palette[level] || palette.warn;
-    el.style.background = p.bg;
-    el.style.color = p.text;
-    el.style.border = p.border;
-
-    const iconEl = el.querySelector("div");
-    if (iconEl) iconEl.style.color = p.iconColor;
-
+    const colors = palette[level] || palette.warn;
     const lines = [line1, line2].filter(Boolean);
-    if (bodyEl) bodyEl.textContent = lines.join(" · ");
 
-    // Animate in
-    el.style.display = "flex";
+    banner.style.background = colors.bg;
+    banner.style.color = colors.text;
+    banner.style.border = colors.border;
+    icon.style.color = colors.iconColor;
+    body.textContent = lines.join(" - ");
+    host.style.display = "block";
+
     requestAnimationFrame(() => {
-      el.style.opacity = "1";
-      el.style.transform = "translateY(0)";
+      banner.style.opacity = "1";
+      banner.style.transform = "translateY(0)";
     });
 
-    // Auto-hide after 12 s
-    clearTimeout(el._autoHide);
-    el._autoHide = setTimeout(() => hideBanner(false), 12000);
+    clearTimeout(host._autoHide);
+    host._autoHide = setTimeout(() => hideBanner(false), AUTO_HIDE_MS);
   }
 
   function hideBanner(manual = false) {
-    const el = document.getElementById(BANNER_ID);
-    if (!el) return;
-    el.style.opacity = "0";
-    el.style.transform = "translateY(8px)";
-    setTimeout(() => { if (el) el.style.display = "none"; }, 280);
+    const host = document.getElementById(HOST_ID);
+    const banner = host?.shadowRoot?.querySelector(".banner");
+
+    if (!host || !banner) {
+      return;
+    }
+
+    banner.style.opacity = "0";
+    banner.style.transform = "translateY(8px)";
+    setTimeout(() => {
+      if (host) {
+        host.style.display = "none";
+      }
+    }, 280);
 
     if (manual) {
-      // Suppress re-showing for 30 minutes after a manual dismiss
-      dismissedUntil = Date.now() + 30 * 60 * 1000;
+      saveDismissal(Date.now() + DISMISS_MS);
     }
   }
 
-  /* ── Listen for messages from background ── */
+  loadDismissal();
+
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "LIFECYCLE_OVERLAY_SHOW") {
       showBanner(message.payload);
