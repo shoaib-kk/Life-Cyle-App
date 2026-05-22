@@ -307,6 +307,135 @@ body {
   letter-spacing: -0.2px;
 }
 
+.onboarding {
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.onboarding:empty {
+  display: none;
+}
+
+.task-panel {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.task-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.task-status {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.task-status.active {
+  color: var(--col-active);
+  font-weight: 600;
+}
+
+.task-input,
+.task-domains {
+  width: 100%;
+  border: 1px solid var(--border-mid);
+  border-radius: 6px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 12px;
+  outline: none;
+}
+
+.task-input {
+  height: 30px;
+  padding: 0 8px;
+}
+
+.task-domains {
+  margin-top: 6px;
+  padding: 7px 8px;
+  resize: vertical;
+  min-height: 58px;
+}
+
+.task-input:focus,
+.task-domains:focus {
+  border-color: var(--col-active);
+}
+
+.task-suggestion {
+  min-height: 14px;
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.task-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.task-btn {
+  height: 26px;
+  border: 1px solid var(--border-mid);
+  border-radius: 6px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-family: var(--font);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.task-btn.primary {
+  background: var(--col-active);
+  color: #fff;
+  border-color: transparent;
+}
+
+.task-btn.danger {
+  color: var(--col-danger-text);
+}
+
+.task-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.task-metric {
+  min-width: 0;
+  padding: 6px;
+  border-radius: 6px;
+  background: var(--bg-surface);
+  text-align: center;
+}
+
+.task-metric-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.task-metric-label {
+  margin-top: 2px;
+  font-size: 9px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 /* ── SETTINGS PANEL ──────────────────────── */
 
 .settings-panel {
@@ -470,6 +599,18 @@ body {
 
 .auth-btn.visible {
   display: inline-block;
+}
+
+.auth-status {
+  min-height: 14px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--col-danger-text);
+  text-align: right;
+}
+
+.auth-status:empty {
+  display: none;
 }
 
 /* ── STAT GRID ───────────────────────────── */

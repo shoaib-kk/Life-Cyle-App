@@ -86,12 +86,31 @@
         <button class="auth-btn secondary" id="signout-btn" type="button">Sign out</button>
       </div>
     </div>
+    <div class="auth-status" id="auth-status"></div>
   </div>
 
   <!-- TOTAL SCREEN TIME BANNER -->
   <div class="total-bar">
     <span class="total-label">Total screen time today</span>
     <span class="total-value" id="total-screen-time">—</span>
+  </div>
+
+  <div class="onboarding" id="onboarding"></div>
+
+  <div class="task-panel" id="task-panel">
+    <div class="task-header">
+      <span class="section-title">Task mode</span>
+      <span class="task-status" id="task-status">Off</span>
+    </div>
+    <input class="task-input" id="task-title" type="text" placeholder="Study probability" />
+    <div class="task-suggestion" id="task-suggestion"></div>
+    <textarea class="task-domains" id="task-domains" rows="3" placeholder="Allowed domains, one per line"></textarea>
+    <div class="task-actions">
+      <button class="task-btn" id="task-suggest-btn" type="button">Suggest</button>
+      <button class="task-btn primary" id="task-start-btn" type="button">Start</button>
+      <button class="task-btn danger" id="task-stop-btn" type="button">Stop</button>
+    </div>
+    <div class="task-metrics" id="task-metrics"></div>
   </div>
 
   <!-- STAT GRID: today / avg / predicted -->

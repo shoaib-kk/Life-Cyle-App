@@ -1,4 +1,4 @@
-const BACKEND_URL = "http://127.0.0.1:8000";
+const DEFAULT_BACKEND_URL = "https://yourdomain.com";
 const AUTH_CALLBACK_PATH = "/extension-callback";
 const STORAGE_SCHEMA_VERSION = 1;
 const BASELINE_WEEKDAY_OCCURRENCES = 8;
@@ -33,6 +33,25 @@ const DEFAULT_DOMAIN_CATEGORIES = {
   "gmail.com": "neutral"
 };
 const CATEGORY_KEYS = ["productive", "distracting", "neutral"];
+const TASK_GROUP_RULES = [
+  {
+    group: "study",
+    patterns: [/study/i, /assignment/i, /mast\d+/i, /unimelb/i, /lecture/i, /exam/i],
+    domains: ["lms.unimelb.edu.au", "canvas.lms.unimelb.edu.au", "edstem.org", "overleaf.com", "docs.google.com"]
+  },
+  {
+    group: "coding",
+    patterns: [/code/i, /coding/i, /github/i, /program/i, /debug/i],
+    domains: ["github.com", "stackoverflow.com", "developer.mozilla.org", "docs.python.org"]
+  },
+  {
+    group: "job search",
+    patterns: [/job/i, /career/i, /resume/i, /linkedin/i, /interview/i],
+    domains: ["linkedin.com", "seek.com.au", "indeed.com", "docs.google.com"]
+  }
+];
+const TASK_DEFAULT_ALLOWED_DOMAINS = ["google.com", "docs.google.com"];
+const TASK_OVERRIDE_DURATION_MS = 5 * 60 * 1000;
 
 let operationQueue = Promise.resolve();
 let lastBackendSyncAt = 0;
@@ -56,6 +75,13 @@ async function getSettings() {
 
 async function setSettings(settings) {
   await chrome.storage.local.set({ settings });
+}
+
+async function getBackendUrl() {
+  const { backendUrl = DEFAULT_BACKEND_URL } = await chrome.storage.local.get({
+    backendUrl: DEFAULT_BACKEND_URL
+  });
+  return String(backendUrl || DEFAULT_BACKEND_URL).replace(/\/+$/, "");
 }
 
 function normalizeSessionShape(session) {
@@ -148,6 +174,115 @@ function categoryForDomain(domain, domainCategories = {}) {
 
 function isExcludedDomain(domain, excludedDomains = []) {
   return Boolean(domain && excludedDomains.includes(domain));
+}
+
+function normalizeAllowedDomain(value) {
+  const raw = String(value || "").trim().toLowerCase();
+
+  if (!raw) {
+    return null;
+  }
+
+  const url = raw.includes("://") ? raw : `https://${raw}`;
+
+  try {
+    let hostname = new URL(url).hostname.toLowerCase();
+    if (hostname.startsWith("www.")) {
+      hostname = hostname.slice(4);
+    }
+    return hostname || null;
+  } catch (_error) {
+    return raw.replace(/^www\./, "") || null;
+  }
+}
+
+function normalizeAllowedDomains(values = []) {
+  const domains = Array.isArray(values)
+    ? values
+    : String(values || "").split(/[\n,]+/);
+  return Array.from(new Set(domains.map(normalizeAllowedDomain).filter(Boolean))).sort();
+}
+
+function isAllowedForTask(domain, allowedDomains = []) {
+  return Boolean(
+    domain &&
+      allowedDomains.some((allowedDomain) => {
+        return domain === allowedDomain || domain.endsWith(`.${allowedDomain}`);
+      })
+  );
+}
+
+function taskSuggestionForTitle(title) {
+  const text = String(title || "").trim();
+  const matchedRule = TASK_GROUP_RULES.find((rule) => rule.patterns.some((pattern) => pattern.test(text)));
+  const rule = matchedRule || {
+    group: "focus",
+    domains: TASK_DEFAULT_ALLOWED_DOMAINS
+  };
+
+  return {
+    title: text,
+    group: rule.group,
+    allowedDomains: normalizeAllowedDomains(rule.domains),
+    note: matchedRule
+      ? `Suggested from ${rule.group} rules. Review before starting.`
+      : "Suggested a small default focus set. Add any resources you need."
+  };
+}
+
+function emptyTaskMetrics() {
+  return {
+    allowedMs: 0,
+    blockedMs: 0,
+    idleMs: 0,
+    tabSwitches: 0,
+    blockedAttempts: 0,
+    overrideCount: 0
+  };
+}
+
+function taskQuality(taskSession) {
+  const metrics = taskSession?.metrics || emptyTaskMetrics();
+  const activeMs = metrics.allowedMs + metrics.blockedMs;
+  const allowedRatio = activeMs > 0 ? metrics.allowedMs / activeMs : 1;
+  const penalty = metrics.blockedAttempts * 3 + metrics.overrideCount * 8 + metrics.tabSwitches * 0.5;
+  return Math.max(0, Math.min(100, Math.round(allowedRatio * 100 - penalty)));
+}
+
+async function getTaskSession() {
+  const { taskSession = null } = await chrome.storage.local.get({ taskSession: null });
+  return taskSession && taskSession.active ? taskSession : null;
+}
+
+async function setTaskSession(taskSession) {
+  await chrome.storage.local.set({ taskSession });
+}
+
+function taskSnapshot(taskSession) {
+  if (!taskSession) {
+    return {
+      active: false,
+      current: null,
+      qualityScore: null
+    };
+  }
+
+  const metrics = taskSession.metrics || emptyTaskMetrics();
+  const activeMs = metrics.allowedMs + metrics.blockedMs;
+  return {
+    active: true,
+    current: {
+      id: taskSession.id,
+      title: taskSession.title,
+      group: taskSession.group,
+      allowedDomains: taskSession.allowedDomains || [],
+      startedAt: taskSession.startedAt,
+      metrics,
+      qualityScore: taskQuality(taskSession),
+      allowedPercent: activeMs > 0 ? Math.round((metrics.allowedMs / activeMs) * 100) : 100,
+      elapsedMinutes: Math.max(0, Math.round((Date.now() - Number(taskSession.startedAt || Date.now())) / 60000))
+    }
+  };
 }
 
 function lifecycleDate(timestamp = Date.now(), resetHour = 0) {
@@ -530,14 +665,16 @@ async function getAuthState() {
   const {
     authToken = null,
     authEmail = null,
-    authUserId = null
+    authUserId = null,
+    authError = ""
   } = await chrome.storage.local.get({
     authToken: null,
     authEmail: null,
-    authUserId: null
+    authUserId: null,
+    authError: ""
   });
 
-  return { authToken, authEmail, authUserId };
+  return { authToken, authEmail, authUserId, authError };
 }
 
 async function getAuthToken() {
@@ -557,8 +694,9 @@ async function authHeaders() {
   };
 }
 
-async function clearAuthState() {
+async function clearAuthState(authError = "") {
   await chrome.storage.local.remove(["authToken", "authEmail", "authUserId"]);
+  await chrome.storage.local.set({ authError });
 }
 
 function pruneDailyHistory(dailyUsage, trackedDays, timestamp = Date.now(), resetHour = 0) {
@@ -976,6 +1114,135 @@ async function getCurrentTrackedDomain() {
   return activeTab?.url ? normalizeDomain(activeTab.url) : null;
 }
 
+async function checkpointTaskSession(snapshot, timestamp = Date.now()) {
+  const taskSession = await getTaskSession();
+
+  if (!taskSession) {
+    return null;
+  }
+
+  const metrics = {
+    ...emptyTaskMetrics(),
+    ...(taskSession.metrics || {})
+  };
+  const lastCheckpointAt = Number(taskSession.lastCheckpointAt || taskSession.startedAt || timestamp);
+  const elapsedMs = Math.max(0, timestamp - lastCheckpointAt);
+  const domain = snapshot?.currentDomain || null;
+  const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
+
+  if (elapsedMs > 0) {
+    if (idleState !== "active" || !snapshot?.focusedWindow) {
+      metrics.idleMs += elapsedMs;
+    } else if (isAllowedForTask(domain, taskSession.allowedDomains)) {
+      metrics.allowedMs += elapsedMs;
+    } else if (domain) {
+      metrics.blockedMs += elapsedMs;
+    }
+  }
+
+  if (
+    taskSession.lastDomain &&
+    domain &&
+    taskSession.lastDomain !== domain &&
+    isAllowedForTask(taskSession.lastDomain, taskSession.allowedDomains) &&
+    isAllowedForTask(domain, taskSession.allowedDomains)
+  ) {
+    metrics.tabSwitches += 1;
+  }
+
+  const nextTaskSession = {
+    ...taskSession,
+    metrics,
+    lastDomain: domain || taskSession.lastDomain || null,
+    lastCheckpointAt: timestamp
+  };
+
+  await setTaskSession(nextTaskSession);
+  return nextTaskSession;
+}
+
+function taskOverrideForDomain(taskSession, domain, timestamp = Date.now()) {
+  const override = taskSession?.overrides?.[domain];
+  return override && Number(override.expiresAt || 0) > timestamp ? override : null;
+}
+
+async function hideTaskBlocker(tabId) {
+  if (!tabId) {
+    return;
+  }
+
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "LIFECYCLE_TASK_BLOCKER_HIDE" });
+  } catch (_error) {
+    // Content script may not be available on browser pages.
+  }
+}
+
+async function showTaskBlocker(tabId, taskSession, domain) {
+  if (!tabId || !taskSession || !domain) {
+    return;
+  }
+
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "LIFECYCLE_TASK_BLOCKER_SHOW",
+      payload: {
+        taskTitle: taskSession.title,
+        group: taskSession.group,
+        domain,
+        allowedDomains: taskSession.allowedDomains || []
+      }
+    });
+  } catch (_error) {
+    // Content script may not be available on browser pages.
+  }
+}
+
+async function enforceTaskMode(snapshot, timestamp = Date.now()) {
+  const taskSession = await checkpointTaskSession(snapshot, timestamp);
+
+  if (!taskSession || !snapshot?.activeTab?.id) {
+    return;
+  }
+
+  const domain = snapshot.currentDomain || null;
+
+  if (!domain) {
+    await hideTaskBlocker(snapshot.activeTab.id);
+    return;
+  }
+
+  if (
+    isAllowedForTask(domain, taskSession.allowedDomains) ||
+    taskOverrideForDomain(taskSession, domain, timestamp)
+  ) {
+    await hideTaskBlocker(snapshot.activeTab.id);
+    return;
+  }
+
+  const blockedKey = `${snapshot.activeTab.id}:${domain}`;
+  const updates = {};
+
+  if (taskSession.lastBlockedKey !== blockedKey) {
+    updates.metrics = {
+      ...emptyTaskMetrics(),
+      ...(taskSession.metrics || {}),
+      blockedAttempts: Number(taskSession.metrics?.blockedAttempts || 0) + 1
+    };
+    updates.lastBlockedKey = blockedKey;
+  }
+
+  const nextTaskSession = Object.keys(updates).length > 0
+    ? { ...taskSession, ...updates }
+    : taskSession;
+
+  if (nextTaskSession !== taskSession) {
+    await setTaskSession(nextTaskSession);
+  }
+
+  await showTaskBlocker(snapshot.activeTab.id, nextTaskSession, domain);
+}
+
 async function refreshActiveContext() {
   const timestamp = Date.now();
   const idleState = await chrome.idle.queryState(IDLE_DETECTION_SECONDS);
@@ -989,6 +1256,11 @@ async function refreshActiveContext() {
     await updateBadge();
     return;
   }
+
+  await enforceTaskMode(
+    { focusedWindow, activeTab, currentDomain: newDomain },
+    timestamp
+  );
 
   if (trackingPaused) {
     await updateCurrentUsage(null, null, timestamp);
@@ -1454,6 +1726,7 @@ async function buildSummary() {
     timestamp: now
   });
   const debug = await buildDebugInfo(focusSnapshot, activeSession, currentDomain);
+  const taskSession = await getTaskSession();
 
   return {
     date: dateKey,
@@ -1467,6 +1740,7 @@ async function buildSummary() {
     categoryBreakdown,
     insights,
     weeklyTrends,
+    taskMode: taskSnapshot(taskSession),
     debug,
     settings,
     baselineType: "same_weekday_average",
@@ -1651,6 +1925,7 @@ async function syncTodayToBackend(options = {}) {
   const dateKey = localDateKey(now, settings.dailyResetHour);
   const { dailyUsage, trackedDays } = await getDailyUsage();
   const usage = dailyUsage[dateKey] || {};
+  const backendUrl = await getBackendUrl();
 
   if (!trackedDays[dateKey]) {
     return;
@@ -1664,14 +1939,14 @@ async function syncTodayToBackend(options = {}) {
   }
 
   try {
-    const response = await fetch(`${BACKEND_URL}/usage`, {
+    const response = await fetch(`${backendUrl}/usage`, {
       method: "POST",
       headers,
       body: JSON.stringify({ date: dateKey, usage, tracked: true })
     });
 
     if (response.status === 401) {
-      await clearAuthState();
+      await clearAuthState("Session expired. Please sign in again.");
       return;
     }
 
@@ -1699,10 +1974,11 @@ async function pullFromBackend() {
   }
 
   try {
-    const response = await fetch(`${BACKEND_URL}/usage/history`, { headers });
+    const backendUrl = await getBackendUrl();
+    const response = await fetch(`${backendUrl}/usage/history`, { headers });
 
     if (response.status === 401) {
-      await clearAuthState();
+      await clearAuthState("Session expired. Please sign in again.");
       return;
     }
 
@@ -1731,8 +2007,10 @@ async function pullFromBackend() {
   }
 }
 
-async function startLoginFlow() {
-  await chrome.tabs.create({ url: `${BACKEND_URL}/login?source=extension` });
+async function startLogin() {
+  const backendUrl = await getBackendUrl();
+  await chrome.storage.local.set({ authError: "" });
+  await chrome.tabs.create({ url: `${backendUrl}/login?source=extension` });
   return getAuthState();
 }
 
@@ -1741,7 +2019,8 @@ async function signOut() {
 
   if (headers) {
     try {
-      await fetch(`${BACKEND_URL}/auth/logout`, {
+      const backendUrl = await getBackendUrl();
+      await fetch(`${backendUrl}/auth/logout`, {
         method: "POST",
         headers
       });
@@ -1763,7 +2042,9 @@ async function handleAuthCallback(tabId, rawUrl) {
     return false;
   }
 
-  if (url.origin !== BACKEND_URL || url.pathname !== AUTH_CALLBACK_PATH) {
+  const backendUrl = await getBackendUrl();
+
+  if (url.origin !== new URL(backendUrl).origin || url.pathname !== AUTH_CALLBACK_PATH) {
     return false;
   }
 
@@ -1778,7 +2059,8 @@ async function handleAuthCallback(tabId, rawUrl) {
   await chrome.storage.local.set({
     authToken: token,
     authEmail: email || null,
-    authUserId: userId || null
+    authUserId: userId || null,
+    authError: ""
   });
   await pullFromBackend();
   await syncTodayToBackend({ force: true });
@@ -1790,6 +2072,103 @@ async function handleAuthCallback(tabId, rawUrl) {
   }
 
   return true;
+}
+
+async function suggestTask(message) {
+  return taskSuggestionForTitle(message.title || "");
+}
+
+async function startTaskSession(message) {
+  const timestamp = Date.now();
+  const suggestion = taskSuggestionForTitle(message.title || "Focus session");
+  const allowedDomains = normalizeAllowedDomains(
+    message.allowedDomains && message.allowedDomains.length > 0
+      ? message.allowedDomains
+      : suggestion.allowedDomains
+  );
+  const taskSession = {
+    id: `task-${timestamp}`,
+    active: true,
+    title: String(message.title || "Focus session").trim() || "Focus session",
+    group: String(message.group || suggestion.group || "focus").trim() || "focus",
+    allowedDomains,
+    startedAt: timestamp,
+    lastCheckpointAt: timestamp,
+    lastDomain: null,
+    lastBlockedKey: null,
+    metrics: emptyTaskMetrics(),
+    overrides: {},
+    overrideLog: []
+  };
+
+  await setTaskSession(taskSession);
+  await refreshActiveContext();
+  return taskSnapshot(taskSession);
+}
+
+async function stopTaskSession() {
+  const snapshot = await getFocusSnapshot();
+  const taskSession = await checkpointTaskSession(snapshot, Date.now());
+
+  if (taskSession) {
+    await chrome.storage.local.set({
+      lastTaskSession: {
+        ...taskSession,
+        active: false,
+        endedAt: Date.now(),
+        qualityScore: taskQuality(taskSession)
+      },
+      taskSession: null
+    });
+  }
+
+  if (snapshot?.activeTab?.id) {
+    await hideTaskBlocker(snapshot.activeTab.id);
+  }
+
+  return taskSnapshot(null);
+}
+
+async function taskOverrideCurrentTab(message, sender) {
+  const timestamp = Date.now();
+  const taskSession = await getTaskSession();
+  const tabId = sender?.tab?.id || message.tabId;
+  const domain = normalizeAllowedDomain(message.domain);
+
+  if (!taskSession || !domain) {
+    return taskSnapshot(taskSession);
+  }
+
+  const metrics = {
+    ...emptyTaskMetrics(),
+    ...(taskSession.metrics || {}),
+    overrideCount: Number(taskSession.metrics?.overrideCount || 0) + 1
+  };
+  const overrideEntry = {
+    domain,
+    attemptedAt: timestamp,
+    expiresAt: timestamp + TASK_OVERRIDE_DURATION_MS
+  };
+  const nextTaskSession = {
+    ...taskSession,
+    metrics,
+    overrides: {
+      ...(taskSession.overrides || {}),
+      [domain]: overrideEntry
+    },
+    overrideLog: [
+      ...(taskSession.overrideLog || []),
+      {
+        domain,
+        reason: String(message.reason || "emergency_override").slice(0, 120),
+        at: timestamp
+      }
+    ].slice(-100)
+  };
+
+  await setTaskSession(nextTaskSession);
+  await hideTaskBlocker(tabId);
+  return taskSnapshot(nextTaskSession);
 }
 
 async function pauseTrackingManually() {
@@ -2011,8 +2390,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     CLEAR_ALL_DATA: clearAllData,
     SET_CURRENT_SITE_CATEGORY: async () => setCurrentSiteCategory(message.category),
     GET_AUTH_STATE: getAuthState,
-    START_LOGIN: startLoginFlow,
-    SIGN_OUT: signOut
+    START_LOGIN: startLogin,
+    SIGN_OUT: signOut,
+    SUGGEST_TASK: suggestTask,
+    START_TASK_SESSION: startTaskSession,
+    STOP_TASK_SESSION: stopTaskSession,
+    TASK_EMERGENCY_OVERRIDE: taskOverrideCurrentTab
   };
 
   const handler = handlers[message?.type];
@@ -2023,7 +2406,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   enqueue(async () => {
     try {
-      const summary = await handler();
+      const summary = await handler(message, _sender);
       sendResponse(summary);
     } catch (error) {
       console.error("LifeCycle message failed", error);

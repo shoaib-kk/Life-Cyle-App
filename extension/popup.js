@@ -49,6 +49,16 @@ const domGearBtn         = $("gear-btn");
 const domSettingsPanel   = $("settings-panel");
 const domLoginBtn        = $("login-btn");
 const domSignoutBtn      = $("signout-btn");
+const domAuthStatus      = $("auth-status");
+const domOnboarding      = $("onboarding");
+const domTaskTitle       = $("task-title");
+const domTaskDomains     = $("task-domains");
+const domTaskSuggestion  = $("task-suggestion");
+const domTaskStatus      = $("task-status");
+const domTaskMetrics     = $("task-metrics");
+const domTaskSuggestBtn  = $("task-suggest-btn");
+const domTaskStartBtn    = $("task-start-btn");
+const domTaskStopBtn     = $("task-stop-btn");
 
 /* ── Theme ───────────────────────────────── */
 
@@ -133,10 +143,12 @@ async function refreshAuthState() {
     domLoginBtn.title = signedIn ? response.authEmail : "Sign in";
     domLoginBtn.classList.toggle("signed-in", signedIn);
     domSignoutBtn.classList.toggle("visible", signedIn);
+    domAuthStatus.textContent = response?.authError || "";
   } catch (_error) {
     domLoginBtn.textContent = "Sign in";
     domLoginBtn.classList.remove("signed-in");
     domSignoutBtn.classList.remove("visible");
+    domAuthStatus.textContent = "";
   }
 }
 
@@ -153,6 +165,84 @@ domLoginBtn.addEventListener("click", async () => {
 domSignoutBtn.addEventListener("click", async () => {
   await chrome.runtime.sendMessage({ type: "SIGN_OUT" });
   await refreshAuthState();
+});
+
+function splitDomainInput(value) {
+  return String(value || "")
+    .split(/[\n,]+/)
+    .map((domain) => domain.trim())
+    .filter(Boolean);
+}
+
+function renderTaskMode(taskMode) {
+  const current = taskMode?.current || null;
+
+  if (!current) {
+    domTaskStatus.textContent = "Off";
+    domTaskStatus.classList.remove("active");
+    domTaskMetrics.innerHTML = "";
+    domTaskStopBtn.disabled = true;
+    domTaskStartBtn.disabled = false;
+    return;
+  }
+
+  domTaskStatus.textContent = current.group || "Active";
+  domTaskStatus.classList.add("active");
+  domTaskTitle.value = current.title || domTaskTitle.value;
+  domTaskDomains.value = (current.allowedDomains || []).join("\n");
+  domTaskStopBtn.disabled = false;
+  domTaskStartBtn.disabled = true;
+
+  const metrics = current.metrics || {};
+  const metricItems = [
+    ["Score", `${current.qualityScore ?? 100}`],
+    ["Allowed", `${current.allowedPercent ?? 100}%`],
+    ["Blocked", `${metrics.blockedAttempts || 0}`],
+    ["Switches", `${metrics.tabSwitches || 0}`],
+    ["Idle", fmt((metrics.idleMs || 0) / 60000)],
+    ["Overrides", `${metrics.overrideCount || 0}`]
+  ];
+
+  domTaskMetrics.innerHTML = metricItems.map(([label, value]) => `
+    <div class="task-metric">
+      <div class="task-metric-value">${value}</div>
+      <div class="task-metric-label">${label}</div>
+    </div>
+  `).join("");
+}
+
+async function suggestTaskFromInput() {
+  const title = domTaskTitle.value.trim();
+  const suggestion = await chrome.runtime.sendMessage({
+    type: "SUGGEST_TASK",
+    title
+  });
+
+  if (!suggestion) {
+    return;
+  }
+
+  domTaskTitle.value = suggestion.title || title;
+  domTaskDomains.value = (suggestion.allowedDomains || []).join("\n");
+  domTaskSuggestion.textContent = `${suggestion.group}: ${suggestion.note}`;
+}
+
+domTaskSuggestBtn.addEventListener("click", suggestTaskFromInput);
+domTaskTitle.addEventListener("change", suggestTaskFromInput);
+
+domTaskStartBtn.addEventListener("click", async () => {
+  const title = domTaskTitle.value.trim() || "Focus session";
+  const response = await chrome.runtime.sendMessage({
+    type: "START_TASK_SESSION",
+    title,
+    allowedDomains: splitDomainInput(domTaskDomains.value)
+  });
+  renderTaskMode(response);
+});
+
+domTaskStopBtn.addEventListener("click", async () => {
+  const response = await chrome.runtime.sendMessage({ type: "STOP_TASK_SESSION" });
+  renderTaskMode(response);
 });
 
 /* ── Confidence dots ─────────────────────── */
@@ -277,6 +367,12 @@ function render(raw) {
   /* ── Total screen time ── */
   const totalMins = Object.values(usageToday).reduce((sum, m) => sum + Number(m || 0), 0);
   domTotalScreenTime.textContent = totalMins > 0 ? fmt(totalMins) : "—";
+  const baselineCount = Number(raw.baselineRecordCount || 0);
+  domOnboarding.textContent =
+    totalMins <= 0 || baselineCount < 2
+      ? "Keep browsing - your first insights appear after a few days of tracking."
+      : "";
+  renderTaskMode(raw.taskMode);
 
   /* ── Top bar ── */
   setFavicon(domain);

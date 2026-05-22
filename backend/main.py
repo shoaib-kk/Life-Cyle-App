@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import date as Date, datetime, timedelta
 import base64
 import hashlib
@@ -23,10 +24,25 @@ ABOVE_BASELINE_THRESHOLD = 0.3
 MIN_BASELINE_RECORDS = 2
 MIN_TRACKED_DAY_MINUTES_FOR_PREDICTION = 30
 MIN_DOMAIN_MINUTES_FOR_PREDICTION = 10
-DB_PATH = Path(__file__).resolve().parents[1] / "data" / "lifecycle.db"
-AUTH_SECRET = os.environ.get("LIFECYCLE_AUTH_SECRET", "lifecycle-dev-secret-change-me")
+DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "lifecycle.db"
+DB_PATH = Path(os.environ.get("LIFECYCLE_DB_PATH", DEFAULT_DB_PATH))
+APP_ENV = os.environ.get("LIFECYCLE_ENV", "development").lower()
+AUTH_SECRET = os.environ.get("LIFECYCLE_AUTH_SECRET")
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "LIFECYCLE_ALLOWED_ORIGINS",
+        "http://127.0.0.1:8000,http://localhost:8000",
+    ).split(",")
+    if origin.strip()
+]
 TOKEN_TTL_DAYS = 30
 PASSWORD_MIN_LENGTH = 8
+
+if not AUTH_SECRET:
+    if APP_ENV in {"production", "prod"}:
+        raise RuntimeError("LIFECYCLE_AUTH_SECRET must be set in production")
+    AUTH_SECRET = "lifecycle-dev-secret-change-me"
 
 
 class UsagePayload(BaseModel):
@@ -40,13 +56,19 @@ class AuthPayload(BaseModel):
     password: str
 
 
-app = FastAPI(title="LifeCycle V1 API")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="LifeCycle V1 API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -472,11 +494,6 @@ def compute_insights(
         "prediction_formula": "predicted_total = (current_usage / elapsed_minutes_today) * 1440",
         "domains": domains,
     }
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    init_db()
 
 
 @app.get("/login", response_class=HTMLResponse)

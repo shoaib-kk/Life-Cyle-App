@@ -5,6 +5,7 @@
   const DISMISSAL_STORAGE_KEY = "overlayDismissals";
   const DISMISS_MS = 30 * 60 * 1000;
   const AUTO_HIDE_MS = 12 * 1000;
+  const BLOCKER_HOST_ID = "lifecycle-task-blocker-host";
 
   let dismissedUntil = 0;
 
@@ -214,6 +215,147 @@
     }
   }
 
+  function ensureTaskBlocker() {
+    let host = document.getElementById(BLOCKER_HOST_ID);
+
+    if (!host) {
+      host = document.createElement("div");
+      host.id = BLOCKER_HOST_ID;
+      Object.assign(host.style, {
+        all: "initial",
+        position: "fixed",
+        inset: "0",
+        zIndex: "2147483647",
+        display: "none"
+      });
+      document.documentElement.appendChild(host);
+    }
+
+    if (!host.shadowRoot) {
+      const root = host.attachShadow({ mode: "open" });
+      root.innerHTML = `
+        <style>
+          :host { all: initial; }
+          .screen {
+            min-height: 100vh;
+            box-sizing: border-box;
+            display: grid;
+            place-items: center;
+            padding: 24px;
+            background: rgba(12, 18, 24, 0.94);
+            color: #f8fafc;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+          }
+          .panel {
+            width: min(520px, 100%);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 8px;
+            background: #111827;
+            padding: 22px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+          }
+          .eyebrow {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #93c5fd;
+            margin-bottom: 8px;
+          }
+          h1 {
+            margin: 0 0 8px;
+            font-size: 22px;
+            line-height: 1.2;
+          }
+          p {
+            margin: 0 0 14px;
+            color: #cbd5e1;
+            font-size: 14px;
+            line-height: 1.5;
+          }
+          .domain {
+            font-weight: 700;
+            color: #fff;
+          }
+          .allowed {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(255, 255, 255, 0.12);
+            color: #94a3b8;
+            font-size: 12px;
+            line-height: 1.5;
+          }
+          button {
+            height: 34px;
+            border: 0;
+            border-radius: 6px;
+            padding: 0 12px;
+            font: inherit;
+            font-size: 13px;
+            cursor: pointer;
+          }
+          .primary {
+            background: #3b82f6;
+            color: white;
+          }
+          .secondary {
+            margin-left: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            color: #e2e8f0;
+          }
+        </style>
+        <div class="screen">
+          <div class="panel">
+            <div class="eyebrow">Task Mode</div>
+            <h1>Blocked for this focus session</h1>
+            <p><span class="domain"></span> is not on the allowed list for <strong class="task"></strong>.</p>
+            <button class="primary" type="button">Emergency override</button>
+            <button class="secondary" type="button">Back to task</button>
+            <div class="allowed"></div>
+          </div>
+        </div>
+      `;
+      root.querySelector(".primary").addEventListener("click", () => {
+        const domain = root.querySelector(".domain")?.textContent || location.hostname;
+        chrome.runtime.sendMessage({
+          type: "TASK_EMERGENCY_OVERRIDE",
+          domain,
+          reason: "emergency_override"
+        });
+        hideTaskBlocker();
+      });
+      root.querySelector(".secondary").addEventListener("click", () => {
+        if (history.length > 1) {
+          history.back();
+        }
+      });
+    }
+
+    return host;
+  }
+
+  function showTaskBlocker(payload = {}) {
+    const host = ensureTaskBlocker();
+    const root = host.shadowRoot;
+    const domain = payload.domain || location.hostname;
+    const allowedDomains = Array.isArray(payload.allowedDomains) ? payload.allowedDomains : [];
+
+    root.querySelector(".domain").textContent = domain;
+    root.querySelector(".task").textContent = payload.taskTitle || "your task";
+    root.querySelector(".allowed").textContent =
+      allowedDomains.length > 0
+        ? `Allowed: ${allowedDomains.join(", ")}`
+        : "No allowed domains were set for this session.";
+    host.style.display = "block";
+  }
+
+  function hideTaskBlocker() {
+    const host = document.getElementById(BLOCKER_HOST_ID);
+    if (host) {
+      host.style.display = "none";
+    }
+  }
+
   loadDismissal();
 
   chrome.runtime.onMessage.addListener((message) => {
@@ -221,6 +363,10 @@
       showBanner(message.payload);
     } else if (message?.type === "LIFECYCLE_OVERLAY_HIDE") {
       hideBanner(false);
+    } else if (message?.type === "LIFECYCLE_TASK_BLOCKER_SHOW") {
+      showTaskBlocker(message.payload);
+    } else if (message?.type === "LIFECYCLE_TASK_BLOCKER_HIDE") {
+      hideTaskBlocker();
     }
   });
 })();
