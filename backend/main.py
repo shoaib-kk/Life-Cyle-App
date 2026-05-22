@@ -56,6 +56,25 @@ class AuthPayload(BaseModel):
     password: str
 
 
+class TaskSessionPayload(BaseModel):
+    profileId: Optional[str] = None
+    profileName: str = "Focus"
+    title: str = "Focus session"
+    group: str = "focus"
+    startedAt: datetime
+    endedAt: datetime
+    durationMinutes: float = 0
+    allowedMinutes: float = 0
+    blockedMinutes: float = 0
+    idleMinutes: float = 0
+    tabSwitches: int = 0
+    blockedAttempts: int = 0
+    overrideCount: int = 0
+    qualityScore: int = 100
+    distractingDomainCounts: Dict[str, int] = Field(default_factory=dict)
+    overrideLog: list[dict] = Field(default_factory=list)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
@@ -118,6 +137,32 @@ def init_db() -> None:
                 usage_date TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, usage_date),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                profile_id TEXT,
+                profile_name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                task_group TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL,
+                duration_minutes REAL NOT NULL,
+                allowed_minutes REAL NOT NULL,
+                blocked_minutes REAL NOT NULL,
+                idle_minutes REAL NOT NULL,
+                tab_switches INTEGER NOT NULL,
+                blocked_attempts INTEGER NOT NULL,
+                override_count INTEGER NOT NULL,
+                quality_score INTEGER NOT NULL,
+                distracting_domain_counts TEXT NOT NULL,
+                override_log TEXT NOT NULL,
+                created_at TEXT NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             """
@@ -705,6 +750,108 @@ def read_usage_history(user: dict = Depends(current_user)) -> dict:
         history.setdefault(row["usage_date"], {})[row["domain"]] = round(float(row["minutes"]), 2)
 
     return {"history": history}
+
+
+@app.post("/task-sessions")
+def save_task_session(payload: TaskSessionPayload, user: dict = Depends(current_user)) -> dict:
+    init_db()
+    with connect() as connection:
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        cursor = connection.execute(
+            """
+            INSERT INTO task_sessions (
+                user_id, profile_id, profile_name, title, task_group,
+                started_at, ended_at, duration_minutes, allowed_minutes,
+                blocked_minutes, idle_minutes, tab_switches, blocked_attempts,
+                override_count, quality_score, distracting_domain_counts,
+                override_log, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"],
+                payload.profileId,
+                payload.profileName,
+                payload.title,
+                payload.group,
+                payload.startedAt.isoformat(),
+                payload.endedAt.isoformat(),
+                max(0.0, float(payload.durationMinutes)),
+                max(0.0, float(payload.allowedMinutes)),
+                max(0.0, float(payload.blockedMinutes)),
+                max(0.0, float(payload.idleMinutes)),
+                max(0, int(payload.tabSwitches)),
+                max(0, int(payload.blockedAttempts)),
+                max(0, int(payload.overrideCount)),
+                max(0, min(100, int(payload.qualityScore))),
+                json.dumps(payload.distractingDomainCounts),
+                json.dumps(payload.overrideLog),
+                now,
+            ),
+        )
+        connection.commit()
+
+    return {"id": cursor.lastrowid, "stored": True}
+
+
+@app.get("/task-sessions/analytics")
+def read_task_session_analytics(user: dict = Depends(current_user)) -> dict:
+    init_db()
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT profile_id, profile_name, allowed_minutes, blocked_attempts,
+                   override_count, quality_score, distracting_domain_counts
+            FROM task_sessions
+            WHERE user_id = ?
+            """,
+            (user["id"],),
+        ).fetchall()
+
+    analytics: dict[str, dict] = {}
+    for row in rows:
+        key = row["profile_id"] or f"ad-hoc:{row['profile_name']}"
+        item = analytics.setdefault(
+            key,
+            {
+                "profileId": key,
+                "profileName": row["profile_name"],
+                "totalFocusMinutes": 0,
+                "blockedAttempts": 0,
+                "overrideCount": 0,
+                "sessionCount": 0,
+                "_qualityTotal": 0,
+                "_domainCounts": {},
+            },
+        )
+        item["totalFocusMinutes"] += round(float(row["allowed_minutes"] or 0))
+        item["blockedAttempts"] += int(row["blocked_attempts"] or 0)
+        item["overrideCount"] += int(row["override_count"] or 0)
+        item["sessionCount"] += 1
+        item["_qualityTotal"] += int(row["quality_score"] or 0)
+
+        try:
+            domain_counts = json.loads(row["distracting_domain_counts"] or "{}")
+        except json.JSONDecodeError:
+            domain_counts = {}
+
+        for domain, count in domain_counts.items():
+            item["_domainCounts"][domain] = item["_domainCounts"].get(domain, 0) + int(count or 0)
+
+    for item in analytics.values():
+        item["averageSessionQuality"] = (
+            round(item["_qualityTotal"] / item["sessionCount"])
+            if item["sessionCount"]
+            else None
+        )
+        item["mostDistractingDomains"] = [
+            {"domain": domain, "count": count}
+            for domain, count in sorted(item["_domainCounts"].items(), key=lambda pair: pair[1], reverse=True)[:3]
+        ]
+        del item["_qualityTotal"]
+        del item["_domainCounts"]
+
+    return {"profiles": analytics}
 
 
 @app.get("/usage/{usage_date}")

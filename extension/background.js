@@ -51,6 +51,47 @@ const TASK_GROUP_RULES = [
   }
 ];
 const TASK_DEFAULT_ALLOWED_DOMAINS = ["google.com", "docs.google.com"];
+const DEFAULT_TASK_PROFILES = [
+  {
+    id: "profile-study",
+    name: "Study",
+    group: "study",
+    allowedDomains: ["lms.unimelb.edu.au", "chatgpt.com", "google.com", "docs.google.com"],
+    blockedDomains: ["youtube.com", "reddit.com"],
+    defaultDuration: 60
+  },
+  {
+    id: "profile-coding",
+    name: "Coding",
+    group: "coding",
+    allowedDomains: ["github.com", "stackoverflow.com", "developer.mozilla.org", "docs.python.org"],
+    blockedDomains: ["youtube.com", "reddit.com", "instagram.com"],
+    defaultDuration: 90
+  },
+  {
+    id: "profile-job-applications",
+    name: "Job applications",
+    group: "job search",
+    allowedDomains: ["linkedin.com", "seek.com.au", "indeed.com", "docs.google.com"],
+    blockedDomains: ["youtube.com", "reddit.com", "instagram.com"],
+    defaultDuration: 60
+  },
+  {
+    id: "profile-assignment-writing",
+    name: "Assignment writing",
+    group: "study",
+    allowedDomains: ["lms.unimelb.edu.au", "overleaf.com", "docs.google.com", "chatgpt.com"],
+    blockedDomains: ["youtube.com", "reddit.com", "instagram.com"],
+    defaultDuration: 120
+  }
+];
+const DOMAIN_CLASSIFICATION_RULES = {
+  "github.com": "Coding",
+  "linkedin.com": "Job search",
+  "lms.unimelb.edu.au": "Study",
+  "youtube.com": "Entertainment",
+  "reddit.com": "Entertainment"
+};
 const TASK_OVERRIDE_DURATION_MS = 5 * 60 * 1000;
 
 let operationQueue = Promise.resolve();
@@ -203,6 +244,63 @@ function normalizeAllowedDomains(values = []) {
   return Array.from(new Set(domains.map(normalizeAllowedDomain).filter(Boolean))).sort();
 }
 
+function normalizeTaskProfile(profile, fallback = {}) {
+  const name = String(profile?.name || fallback.name || "Focus").trim() || "Focus";
+  const id = String(profile?.id || fallback.id || `profile-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`).replace(/-+$/g, "");
+  return {
+    id,
+    name,
+    group: String(profile?.group || fallback.group || name.toLowerCase()).trim() || "focus",
+    allowedDomains: normalizeAllowedDomains(profile?.allowedDomains || fallback.allowedDomains || []),
+    blockedDomains: normalizeAllowedDomains(profile?.blockedDomains || fallback.blockedDomains || []),
+    defaultDuration: Math.max(5, Math.min(480, Number(profile?.defaultDuration || fallback.defaultDuration || 60)))
+  };
+}
+
+async function getTaskProfiles() {
+  const { taskProfiles = null } = await chrome.storage.local.get({ taskProfiles: null });
+
+  if (!Array.isArray(taskProfiles) || taskProfiles.length === 0) {
+    const defaults = DEFAULT_TASK_PROFILES.map((profile) => normalizeTaskProfile(profile));
+    await chrome.storage.local.set({ taskProfiles: defaults });
+    return defaults;
+  }
+
+  return taskProfiles.map((profile) => normalizeTaskProfile(profile));
+}
+
+async function saveTaskProfile(profile) {
+  const profiles = await getTaskProfiles();
+  const normalized = normalizeTaskProfile(profile);
+  const index = profiles.findIndex((item) => item.id === normalized.id);
+
+  if (index >= 0) {
+    profiles[index] = normalized;
+  } else {
+    profiles.push(normalized);
+  }
+
+  await chrome.storage.local.set({ taskProfiles: profiles });
+  return { profiles, profile: normalized };
+}
+
+async function deleteTaskProfile(profileId) {
+  const profiles = (await getTaskProfiles()).filter((profile) => profile.id !== profileId);
+  await chrome.storage.local.set({ taskProfiles: profiles });
+  return { profiles };
+}
+
+function classifyDomain(domain) {
+  if (!domain) {
+    return "Unknown";
+  }
+
+  const matched = Object.entries(DOMAIN_CLASSIFICATION_RULES).find(([ruleDomain]) => {
+    return domain === ruleDomain || domain.endsWith(`.${ruleDomain}`);
+  });
+  return matched ? matched[1] : "Other";
+}
+
 function isAllowedForTask(domain, allowedDomains = []) {
   return Boolean(
     domain &&
@@ -224,6 +322,8 @@ function taskSuggestionForTitle(title) {
     title: text,
     group: rule.group,
     allowedDomains: normalizeAllowedDomains(rule.domains),
+    blockedDomains: normalizeAllowedDomains(["youtube.com", "reddit.com", "instagram.com"]),
+    defaultDuration: rule.group === "coding" ? 90 : 60,
     note: matchedRule
       ? `Suggested from ${rule.group} rules. Review before starting.`
       : "Suggested a small default focus set. Add any resources you need."
@@ -239,6 +339,10 @@ function emptyTaskMetrics() {
     blockedAttempts: 0,
     overrideCount: 0
   };
+}
+
+function emptyDistractingDomainCounts() {
+  return {};
 }
 
 function taskQuality(taskSession) {
@@ -258,6 +362,97 @@ async function setTaskSession(taskSession) {
   await chrome.storage.local.set({ taskSession });
 }
 
+async function getTaskSessionHistory() {
+  const { taskSessionHistory = [] } = await chrome.storage.local.get({ taskSessionHistory: [] });
+  return Array.isArray(taskSessionHistory) ? taskSessionHistory : [];
+}
+
+function taskSessionSummaryForHistory(taskSession, endedAt = Date.now()) {
+  const metrics = {
+    ...emptyTaskMetrics(),
+    ...(taskSession.metrics || {})
+  };
+  const distractingDomainCounts = taskSession.distractingDomainCounts || emptyDistractingDomainCounts();
+
+  return {
+    id: taskSession.id,
+    profileId: taskSession.profileId || null,
+    profileName: taskSession.profileName || taskSession.group || "Focus",
+    title: taskSession.title,
+    group: taskSession.group,
+    startedAt: taskSession.startedAt,
+    endedAt,
+    durationMinutes: Math.max(0, Math.round((endedAt - Number(taskSession.startedAt || endedAt)) / 60000)),
+    allowedMinutes: Math.round((metrics.allowedMs || 0) / 60000),
+    blockedMinutes: Math.round((metrics.blockedMs || 0) / 60000),
+    idleMinutes: Math.round((metrics.idleMs || 0) / 60000),
+    tabSwitches: metrics.tabSwitches || 0,
+    blockedAttempts: metrics.blockedAttempts || 0,
+    overrideCount: metrics.overrideCount || 0,
+    qualityScore: taskQuality(taskSession),
+    distractingDomainCounts,
+    overrideLog: taskSession.overrideLog || []
+  };
+}
+
+function profileAnalyticsFromHistory(history, profiles) {
+  const analytics = {};
+
+  for (const profile of profiles) {
+    analytics[profile.id] = {
+      profileId: profile.id,
+      profileName: profile.name,
+      totalFocusMinutes: 0,
+      averageSessionQuality: null,
+      blockedAttempts: 0,
+      overrideCount: 0,
+      mostDistractingDomains: [],
+      sessionCount: 0
+    };
+  }
+
+  for (const session of history) {
+    const key = session.profileId || `ad-hoc:${session.profileName || session.group || "Focus"}`;
+    if (!analytics[key]) {
+      analytics[key] = {
+        profileId: key,
+        profileName: session.profileName || session.group || "Focus",
+        totalFocusMinutes: 0,
+        averageSessionQuality: null,
+        blockedAttempts: 0,
+        overrideCount: 0,
+        mostDistractingDomains: [],
+        sessionCount: 0
+      };
+    }
+
+    const item = analytics[key];
+    item.totalFocusMinutes += Number(session.allowedMinutes || 0);
+    item.blockedAttempts += Number(session.blockedAttempts || 0);
+    item.overrideCount += Number(session.overrideCount || 0);
+    item.sessionCount += 1;
+    item._qualityTotal = Number(item._qualityTotal || 0) + Number(session.qualityScore || 0);
+    item._domainCounts = item._domainCounts || {};
+
+    for (const [domain, count] of Object.entries(session.distractingDomainCounts || {})) {
+      item._domainCounts[domain] = (item._domainCounts[domain] || 0) + Number(count || 0);
+    }
+  }
+
+  for (const item of Object.values(analytics)) {
+    item.averageSessionQuality =
+      item.sessionCount > 0 ? Math.round(Number(item._qualityTotal || 0) / item.sessionCount) : null;
+    item.mostDistractingDomains = Object.entries(item._domainCounts || {})
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 3)
+      .map(([domain, count]) => ({ domain, count, classification: classifyDomain(domain) }));
+    delete item._qualityTotal;
+    delete item._domainCounts;
+  }
+
+  return analytics;
+}
+
 function taskSnapshot(taskSession) {
   if (!taskSession) {
     return {
@@ -275,9 +470,14 @@ function taskSnapshot(taskSession) {
       id: taskSession.id,
       title: taskSession.title,
       group: taskSession.group,
+      profileId: taskSession.profileId || null,
+      profileName: taskSession.profileName || taskSession.group,
       allowedDomains: taskSession.allowedDomains || [],
+      blockedDomains: taskSession.blockedDomains || [],
+      defaultDuration: taskSession.defaultDuration || null,
       startedAt: taskSession.startedAt,
       metrics,
+      distractingDomainCounts: taskSession.distractingDomainCounts || emptyDistractingDomainCounts(),
       qualityScore: taskQuality(taskSession),
       allowedPercent: activeMs > 0 ? Math.round((metrics.allowedMs / activeMs) * 100) : 100,
       elapsedMinutes: Math.max(0, Math.round((Date.now() - Number(taskSession.startedAt || Date.now())) / 60000))
@@ -1229,6 +1429,10 @@ async function enforceTaskMode(snapshot, timestamp = Date.now()) {
       ...(taskSession.metrics || {}),
       blockedAttempts: Number(taskSession.metrics?.blockedAttempts || 0) + 1
     };
+    updates.distractingDomainCounts = {
+      ...(taskSession.distractingDomainCounts || {}),
+      [domain]: Number(taskSession.distractingDomainCounts?.[domain] || 0) + 1
+    };
     updates.lastBlockedKey = blockedKey;
   }
 
@@ -1727,6 +1931,9 @@ async function buildSummary() {
   });
   const debug = await buildDebugInfo(focusSnapshot, activeSession, currentDomain);
   const taskSession = await getTaskSession();
+  const taskProfiles = await getTaskProfiles();
+  const taskSessionHistory = await getTaskSessionHistory();
+  const taskProfileAnalytics = profileAnalyticsFromHistory(taskSessionHistory, taskProfiles);
 
   return {
     date: dateKey,
@@ -1741,6 +1948,8 @@ async function buildSummary() {
     insights,
     weeklyTrends,
     taskMode: taskSnapshot(taskSession),
+    taskProfiles,
+    taskProfileAnalytics,
     debug,
     settings,
     baselineType: "same_weekday_average",
@@ -2033,6 +2242,46 @@ async function signOut() {
   return getAuthState();
 }
 
+async function syncTaskSessionToBackend(sessionSummary) {
+  const headers = await authHeaders();
+
+  if (!headers || !sessionSummary) {
+    return;
+  }
+
+  try {
+    const backendUrl = await getBackendUrl();
+    const response = await fetch(`${backendUrl}/task-sessions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        profileId: sessionSummary.profileId,
+        profileName: sessionSummary.profileName,
+        title: sessionSummary.title,
+        group: sessionSummary.group,
+        startedAt: new Date(sessionSummary.startedAt).toISOString(),
+        endedAt: new Date(sessionSummary.endedAt).toISOString(),
+        durationMinutes: sessionSummary.durationMinutes,
+        allowedMinutes: sessionSummary.allowedMinutes,
+        blockedMinutes: sessionSummary.blockedMinutes,
+        idleMinutes: sessionSummary.idleMinutes,
+        tabSwitches: sessionSummary.tabSwitches,
+        blockedAttempts: sessionSummary.blockedAttempts,
+        overrideCount: sessionSummary.overrideCount,
+        qualityScore: sessionSummary.qualityScore,
+        distractingDomainCounts: sessionSummary.distractingDomainCounts,
+        overrideLog: sessionSummary.overrideLog
+      })
+    });
+
+    if (response.status === 401) {
+      await clearAuthState("Session expired. Please sign in again.");
+    }
+  } catch (_error) {
+    // Task analytics remain available locally if backend sync fails.
+  }
+}
+
 async function handleAuthCallback(tabId, rawUrl) {
   let url;
 
@@ -2080,23 +2329,36 @@ async function suggestTask(message) {
 
 async function startTaskSession(message) {
   const timestamp = Date.now();
+  const profiles = await getTaskProfiles();
+  const profile = profiles.find((item) => item.id === message.profileId) || null;
   const suggestion = taskSuggestionForTitle(message.title || "Focus session");
   const allowedDomains = normalizeAllowedDomains(
     message.allowedDomains && message.allowedDomains.length > 0
       ? message.allowedDomains
-      : suggestion.allowedDomains
+      : profile?.allowedDomains || suggestion.allowedDomains
   );
+  const blockedDomains = normalizeAllowedDomains(
+    message.blockedDomains && message.blockedDomains.length > 0
+      ? message.blockedDomains
+      : profile?.blockedDomains || suggestion.blockedDomains || []
+  );
+  const title = String(message.title || profile?.name || "Focus session").trim() || "Focus session";
   const taskSession = {
     id: `task-${timestamp}`,
     active: true,
-    title: String(message.title || "Focus session").trim() || "Focus session",
-    group: String(message.group || suggestion.group || "focus").trim() || "focus",
+    profileId: profile?.id || message.profileId || null,
+    profileName: profile?.name || null,
+    title,
+    group: String(message.group || profile?.group || suggestion.group || "focus").trim() || "focus",
     allowedDomains,
+    blockedDomains,
+    defaultDuration: Math.max(5, Math.min(480, Number(message.defaultDuration || profile?.defaultDuration || suggestion.defaultDuration || 60))),
     startedAt: timestamp,
     lastCheckpointAt: timestamp,
     lastDomain: null,
     lastBlockedKey: null,
     metrics: emptyTaskMetrics(),
+    distractingDomainCounts: emptyDistractingDomainCounts(),
     overrides: {},
     overrideLog: []
   };
@@ -2111,15 +2373,14 @@ async function stopTaskSession() {
   const taskSession = await checkpointTaskSession(snapshot, Date.now());
 
   if (taskSession) {
+    const completedSession = taskSessionSummaryForHistory(taskSession, Date.now());
+    const history = await getTaskSessionHistory();
     await chrome.storage.local.set({
-      lastTaskSession: {
-        ...taskSession,
-        active: false,
-        endedAt: Date.now(),
-        qualityScore: taskQuality(taskSession)
-      },
+      lastTaskSession: completedSession,
+      taskSessionHistory: [...history, completedSession].slice(-500),
       taskSession: null
     });
+    await syncTaskSessionToBackend(completedSession);
   }
 
   if (snapshot?.activeTab?.id) {
@@ -2169,6 +2430,21 @@ async function taskOverrideCurrentTab(message, sender) {
   await setTaskSession(nextTaskSession);
   await hideTaskBlocker(tabId);
   return taskSnapshot(nextTaskSession);
+}
+
+async function saveTaskProfileFromMessage(message) {
+  return saveTaskProfile({
+    id: message.profile?.id,
+    name: message.profile?.name,
+    group: message.profile?.group,
+    allowedDomains: message.profile?.allowedDomains,
+    blockedDomains: message.profile?.blockedDomains,
+    defaultDuration: message.profile?.defaultDuration
+  });
+}
+
+async function deleteTaskProfileFromMessage(message) {
+  return deleteTaskProfile(message.profileId);
 }
 
 async function pauseTrackingManually() {
@@ -2395,7 +2671,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     SUGGEST_TASK: suggestTask,
     START_TASK_SESSION: startTaskSession,
     STOP_TASK_SESSION: stopTaskSession,
-    TASK_EMERGENCY_OVERRIDE: taskOverrideCurrentTab
+    TASK_EMERGENCY_OVERRIDE: taskOverrideCurrentTab,
+    SAVE_TASK_PROFILE: saveTaskProfileFromMessage,
+    DELETE_TASK_PROFILE: deleteTaskProfileFromMessage
   };
 
   const handler = handlers[message?.type];

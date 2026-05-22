@@ -102,15 +102,22 @@
       <span class="section-title">Task mode</span>
       <span class="task-status" id="task-status">Off</span>
     </div>
+    <div class="task-profile-row">
+      <select class="task-profile-select" id="task-profile-select"></select>
+      <input class="task-duration" id="task-duration" type="number" min="5" max="480" step="5" value="60" title="Default duration in minutes" />
+    </div>
     <input class="task-input" id="task-title" type="text" placeholder="Study probability" />
     <div class="task-suggestion" id="task-suggestion"></div>
     <textarea class="task-domains" id="task-domains" rows="3" placeholder="Allowed domains, one per line"></textarea>
+    <textarea class="task-domains" id="task-blocked-domains" rows="2" placeholder="Blocked domains, one per line"></textarea>
     <div class="task-actions">
       <button class="task-btn" id="task-suggest-btn" type="button">Suggest</button>
+      <button class="task-btn" id="task-save-profile-btn" type="button">Save profile</button>
       <button class="task-btn primary" id="task-start-btn" type="button">Start</button>
       <button class="task-btn danger" id="task-stop-btn" type="button">Stop</button>
     </div>
     <div class="task-metrics" id="task-metrics"></div>
+    <div class="profile-analytics" id="profile-analytics"></div>
   </div>
 
   <!-- STAT GRID: today / avg / predicted -->

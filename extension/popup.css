@@ -344,7 +344,9 @@ body {
 }
 
 .task-input,
-.task-domains {
+.task-domains,
+.task-profile-select,
+.task-duration {
   width: 100%;
   border: 1px solid var(--border-mid);
   border-radius: 6px;
@@ -356,6 +358,19 @@ body {
 }
 
 .task-input {
+  height: 30px;
+  padding: 0 8px;
+}
+
+.task-profile-row {
+  display: grid;
+  grid-template-columns: 1fr 58px;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.task-profile-select,
+.task-duration {
   height: 30px;
   padding: 0 8px;
 }
@@ -381,7 +396,7 @@ body {
 
 .task-actions {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: repeat(4, 1fr);
   gap: 6px;
   margin-top: 8px;
 }
@@ -434,6 +449,17 @@ body {
   color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+.profile-analytics {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.profile-analytics:empty {
+  display: none;
 }
 
 /* ── SETTINGS PANEL ──────────────────────── */

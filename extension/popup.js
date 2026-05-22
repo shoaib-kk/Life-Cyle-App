@@ -53,10 +53,15 @@ const domAuthStatus      = $("auth-status");
 const domOnboarding      = $("onboarding");
 const domTaskTitle       = $("task-title");
 const domTaskDomains     = $("task-domains");
+const domTaskBlockedDomains = $("task-blocked-domains");
+const domTaskProfileSelect = $("task-profile-select");
+const domTaskDuration    = $("task-duration");
 const domTaskSuggestion  = $("task-suggestion");
 const domTaskStatus      = $("task-status");
 const domTaskMetrics     = $("task-metrics");
+const domProfileAnalytics = $("profile-analytics");
 const domTaskSuggestBtn  = $("task-suggest-btn");
+const domTaskSaveProfileBtn = $("task-save-profile-btn");
 const domTaskStartBtn    = $("task-start-btn");
 const domTaskStopBtn     = $("task-stop-btn");
 
@@ -174,6 +179,56 @@ function splitDomainInput(value) {
     .filter(Boolean);
 }
 
+function selectedProfile(raw) {
+  const profileId = domTaskProfileSelect.value;
+  return (raw?.taskProfiles || []).find((profile) => profile.id === profileId) || null;
+}
+
+function fillProfile(profile) {
+  if (!profile) {
+    return;
+  }
+
+  domTaskTitle.value = profile.name;
+  domTaskDomains.value = (profile.allowedDomains || []).join("\n");
+  domTaskBlockedDomains.value = (profile.blockedDomains || []).join("\n");
+  domTaskDuration.value = profile.defaultDuration || 60;
+  domTaskSuggestion.textContent = `${profile.name}: saved profile`;
+}
+
+function renderTaskProfiles(raw) {
+  const profiles = raw?.taskProfiles || [];
+  const previous = domTaskProfileSelect.value;
+
+  domTaskProfileSelect.innerHTML = profiles.map((profile) => {
+    return `<option value="${profile.id}">${profile.name}</option>`;
+  }).join("");
+
+  if (profiles.some((profile) => profile.id === previous)) {
+    domTaskProfileSelect.value = previous;
+  }
+
+  if (!previous && profiles[0]) {
+    domTaskProfileSelect.value = profiles[0].id;
+    fillProfile(profiles[0]);
+  }
+
+  const profile = selectedProfile(raw);
+  const analytics = profile ? raw?.taskProfileAnalytics?.[profile.id] : null;
+  if (!analytics) {
+    domProfileAnalytics.textContent = "";
+    return;
+  }
+
+  const distractions = (analytics.mostDistractingDomains || [])
+    .map((item) => `${item.domain} (${item.count})`)
+    .join(", ");
+  domProfileAnalytics.textContent =
+    `${analytics.totalFocusMinutes}m focus · ${analytics.averageSessionQuality ?? "-"} avg score · ` +
+    `${analytics.blockedAttempts} blocks · ${analytics.overrideCount} overrides` +
+    (distractions ? ` · distractions: ${distractions}` : "");
+}
+
 function renderTaskMode(taskMode) {
   const current = taskMode?.current || null;
 
@@ -190,6 +245,11 @@ function renderTaskMode(taskMode) {
   domTaskStatus.classList.add("active");
   domTaskTitle.value = current.title || domTaskTitle.value;
   domTaskDomains.value = (current.allowedDomains || []).join("\n");
+  domTaskBlockedDomains.value = (current.blockedDomains || []).join("\n");
+  domTaskDuration.value = current.defaultDuration || domTaskDuration.value || 60;
+  if (current.profileId) {
+    domTaskProfileSelect.value = current.profileId;
+  }
   domTaskStopBtn.disabled = false;
   domTaskStartBtn.disabled = true;
 
@@ -224,18 +284,46 @@ async function suggestTaskFromInput() {
 
   domTaskTitle.value = suggestion.title || title;
   domTaskDomains.value = (suggestion.allowedDomains || []).join("\n");
+  domTaskBlockedDomains.value = (suggestion.blockedDomains || []).join("\n");
+  domTaskDuration.value = suggestion.defaultDuration || 60;
   domTaskSuggestion.textContent = `${suggestion.group}: ${suggestion.note}`;
 }
 
 domTaskSuggestBtn.addEventListener("click", suggestTaskFromInput);
 domTaskTitle.addEventListener("change", suggestTaskFromInput);
+domTaskProfileSelect.addEventListener("change", async () => {
+  const response = await chrome.runtime.sendMessage({ type: "GET_USAGE_SUMMARY" });
+  fillProfile(selectedProfile(response));
+  renderTaskProfiles(response);
+});
+
+domTaskSaveProfileBtn.addEventListener("click", async () => {
+  const existingId = domTaskProfileSelect.value || null;
+  const name = domTaskTitle.value.trim() || "Focus";
+  const response = await chrome.runtime.sendMessage({
+    type: "SAVE_TASK_PROFILE",
+    profile: {
+      id: existingId,
+      name,
+      group: name.toLowerCase(),
+      allowedDomains: splitDomainInput(domTaskDomains.value),
+      blockedDomains: splitDomainInput(domTaskBlockedDomains.value),
+      defaultDuration: Number(domTaskDuration.value || 60)
+    }
+  });
+
+  domTaskSuggestion.textContent = `${response?.profile?.name || name}: profile saved`;
+});
 
 domTaskStartBtn.addEventListener("click", async () => {
   const title = domTaskTitle.value.trim() || "Focus session";
   const response = await chrome.runtime.sendMessage({
     type: "START_TASK_SESSION",
+    profileId: domTaskProfileSelect.value || null,
     title,
-    allowedDomains: splitDomainInput(domTaskDomains.value)
+    allowedDomains: splitDomainInput(domTaskDomains.value),
+    blockedDomains: splitDomainInput(domTaskBlockedDomains.value),
+    defaultDuration: Number(domTaskDuration.value || 60)
   });
   renderTaskMode(response);
 });
@@ -372,6 +460,7 @@ function render(raw) {
     totalMins <= 0 || baselineCount < 2
       ? "Keep browsing - your first insights appear after a few days of tracking."
       : "";
+  renderTaskProfiles(raw);
   renderTaskMode(raw.taskMode);
 
   /* ── Top bar ── */
