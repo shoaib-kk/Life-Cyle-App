@@ -53,36 +53,36 @@ const TASK_GROUP_RULES = [
 const TASK_DEFAULT_ALLOWED_DOMAINS = ["google.com", "docs.google.com"];
 const DEFAULT_TASK_PROFILES = [
   {
-    id: "profile-study",
+    id: "study",
     name: "Study",
     group: "study",
-    allowedDomains: ["lms.unimelb.edu.au", "chatgpt.com", "google.com", "docs.google.com"],
+    allowedDomains: ["lms.unimelb.edu.au", "chatgpt.com", "docs.google.com"],
     blockedDomains: ["youtube.com", "reddit.com"],
-    defaultDuration: 60
+    defaultDurationMinutes: 60
   },
   {
-    id: "profile-coding",
+    id: "coding",
     name: "Coding",
     group: "coding",
     allowedDomains: ["github.com", "stackoverflow.com", "developer.mozilla.org", "docs.python.org"],
     blockedDomains: ["youtube.com", "reddit.com", "instagram.com"],
-    defaultDuration: 90
+    defaultDurationMinutes: 90
   },
   {
-    id: "profile-job-applications",
+    id: "job-applications",
     name: "Job applications",
     group: "job search",
     allowedDomains: ["linkedin.com", "seek.com.au", "indeed.com", "docs.google.com"],
     blockedDomains: ["youtube.com", "reddit.com", "instagram.com"],
-    defaultDuration: 60
+    defaultDurationMinutes: 60
   },
   {
-    id: "profile-assignment-writing",
+    id: "assignment-writing",
     name: "Assignment writing",
     group: "study",
     allowedDomains: ["lms.unimelb.edu.au", "overleaf.com", "docs.google.com", "chatgpt.com"],
     blockedDomains: ["youtube.com", "reddit.com", "instagram.com"],
-    defaultDuration: 120
+    defaultDurationMinutes: 120
   }
 ];
 const DOMAIN_CLASSIFICATION_RULES = {
@@ -247,13 +247,23 @@ function normalizeAllowedDomains(values = []) {
 function normalizeTaskProfile(profile, fallback = {}) {
   const name = String(profile?.name || fallback.name || "Focus").trim() || "Focus";
   const id = String(profile?.id || fallback.id || `profile-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`).replace(/-+$/g, "");
+  const now = new Date().toISOString();
+  const defaultDurationMinutes = Number(
+    profile?.defaultDurationMinutes ||
+      profile?.defaultDuration ||
+      fallback.defaultDurationMinutes ||
+      fallback.defaultDuration ||
+      60
+  );
   return {
     id,
     name,
     group: String(profile?.group || fallback.group || name.toLowerCase()).trim() || "focus",
     allowedDomains: normalizeAllowedDomains(profile?.allowedDomains || fallback.allowedDomains || []),
     blockedDomains: normalizeAllowedDomains(profile?.blockedDomains || fallback.blockedDomains || []),
-    defaultDuration: Math.max(5, Math.min(480, Number(profile?.defaultDuration || fallback.defaultDuration || 60)))
+    defaultDurationMinutes: Math.max(5, Math.min(480, defaultDurationMinutes)),
+    createdAt: profile?.createdAt || fallback.createdAt || now,
+    updatedAt: profile?.updatedAt || fallback.updatedAt || now
   };
 }
 
@@ -271,7 +281,12 @@ async function getTaskProfiles() {
 
 async function saveTaskProfile(profile) {
   const profiles = await getTaskProfiles();
-  const normalized = normalizeTaskProfile(profile);
+  const existing = profiles.find((item) => item.id === profile?.id) || null;
+  const normalized = {
+    ...normalizeTaskProfile(profile, existing || {}),
+    createdAt: existing?.createdAt || profile?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
   const index = profiles.findIndex((item) => item.id === normalized.id);
 
   if (index >= 0) {
@@ -323,7 +338,7 @@ function taskSuggestionForTitle(title) {
     group: rule.group,
     allowedDomains: normalizeAllowedDomains(rule.domains),
     blockedDomains: normalizeAllowedDomains(["youtube.com", "reddit.com", "instagram.com"]),
-    defaultDuration: rule.group === "coding" ? 90 : 60,
+    defaultDurationMinutes: rule.group === "coding" ? 90 : 60,
     note: matchedRule
       ? `Suggested from ${rule.group} rules. Review before starting.`
       : "Suggested a small default focus set. Add any resources you need."
@@ -474,7 +489,7 @@ function taskSnapshot(taskSession) {
       profileName: taskSession.profileName || taskSession.group,
       allowedDomains: taskSession.allowedDomains || [],
       blockedDomains: taskSession.blockedDomains || [],
-      defaultDuration: taskSession.defaultDuration || null,
+      defaultDurationMinutes: taskSession.defaultDurationMinutes || null,
       startedAt: taskSession.startedAt,
       metrics,
       distractingDomainCounts: taskSession.distractingDomainCounts || emptyDistractingDomainCounts(),
@@ -2352,7 +2367,19 @@ async function startTaskSession(message) {
     group: String(message.group || profile?.group || suggestion.group || "focus").trim() || "focus",
     allowedDomains,
     blockedDomains,
-    defaultDuration: Math.max(5, Math.min(480, Number(message.defaultDuration || profile?.defaultDuration || suggestion.defaultDuration || 60))),
+    defaultDurationMinutes: Math.max(
+      5,
+      Math.min(
+        480,
+        Number(
+          message.defaultDurationMinutes ||
+            message.defaultDuration ||
+            profile?.defaultDurationMinutes ||
+            suggestion.defaultDurationMinutes ||
+            60
+        )
+      )
+    ),
     startedAt: timestamp,
     lastCheckpointAt: timestamp,
     lastDomain: null,
@@ -2439,7 +2466,7 @@ async function saveTaskProfileFromMessage(message) {
     group: message.profile?.group,
     allowedDomains: message.profile?.allowedDomains,
     blockedDomains: message.profile?.blockedDomains,
-    defaultDuration: message.profile?.defaultDuration
+    defaultDurationMinutes: message.profile?.defaultDurationMinutes || message.profile?.defaultDuration
   });
 }
 

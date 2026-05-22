@@ -62,6 +62,7 @@ const domTaskMetrics     = $("task-metrics");
 const domProfileAnalytics = $("profile-analytics");
 const domTaskSuggestBtn  = $("task-suggest-btn");
 const domTaskSaveProfileBtn = $("task-save-profile-btn");
+const domTaskDeleteProfileBtn = $("task-delete-profile-btn");
 const domTaskStartBtn    = $("task-start-btn");
 const domTaskStopBtn     = $("task-stop-btn");
 
@@ -181,18 +182,26 @@ function splitDomainInput(value) {
 
 function selectedProfile(raw) {
   const profileId = domTaskProfileSelect.value;
+  if (profileId === "__new__") {
+    return null;
+  }
   return (raw?.taskProfiles || []).find((profile) => profile.id === profileId) || null;
 }
 
 function fillProfile(profile) {
   if (!profile) {
+    domTaskTitle.value = "";
+    domTaskDomains.value = "";
+    domTaskBlockedDomains.value = "";
+    domTaskDuration.value = 60;
+    domTaskSuggestion.textContent = "New profile";
     return;
   }
 
   domTaskTitle.value = profile.name;
   domTaskDomains.value = (profile.allowedDomains || []).join("\n");
   domTaskBlockedDomains.value = (profile.blockedDomains || []).join("\n");
-  domTaskDuration.value = profile.defaultDuration || 60;
+  domTaskDuration.value = profile.defaultDurationMinutes || profile.defaultDuration || 60;
   domTaskSuggestion.textContent = `${profile.name}: saved profile`;
 }
 
@@ -200,9 +209,10 @@ function renderTaskProfiles(raw) {
   const profiles = raw?.taskProfiles || [];
   const previous = domTaskProfileSelect.value;
 
-  domTaskProfileSelect.innerHTML = profiles.map((profile) => {
-    return `<option value="${profile.id}">${profile.name}</option>`;
-  }).join("");
+  domTaskProfileSelect.innerHTML = [
+    ...profiles.map((profile) => `<option value="${profile.id}">${profile.name}</option>`),
+    '<option value="__new__">New profile...</option>'
+  ].join("");
 
   if (profiles.some((profile) => profile.id === previous)) {
     domTaskProfileSelect.value = previous;
@@ -246,7 +256,7 @@ function renderTaskMode(taskMode) {
   domTaskTitle.value = current.title || domTaskTitle.value;
   domTaskDomains.value = (current.allowedDomains || []).join("\n");
   domTaskBlockedDomains.value = (current.blockedDomains || []).join("\n");
-  domTaskDuration.value = current.defaultDuration || domTaskDuration.value || 60;
+  domTaskDuration.value = current.defaultDurationMinutes || current.defaultDuration || domTaskDuration.value || 60;
   if (current.profileId) {
     domTaskProfileSelect.value = current.profileId;
   }
@@ -285,7 +295,7 @@ async function suggestTaskFromInput() {
   domTaskTitle.value = suggestion.title || title;
   domTaskDomains.value = (suggestion.allowedDomains || []).join("\n");
   domTaskBlockedDomains.value = (suggestion.blockedDomains || []).join("\n");
-  domTaskDuration.value = suggestion.defaultDuration || 60;
+  domTaskDuration.value = suggestion.defaultDurationMinutes || suggestion.defaultDuration || 60;
   domTaskSuggestion.textContent = `${suggestion.group}: ${suggestion.note}`;
 }
 
@@ -298,7 +308,8 @@ domTaskProfileSelect.addEventListener("change", async () => {
 });
 
 domTaskSaveProfileBtn.addEventListener("click", async () => {
-  const existingId = domTaskProfileSelect.value || null;
+  const selectedId = domTaskProfileSelect.value;
+  const existingId = selectedId && selectedId !== "__new__" ? selectedId : null;
   const name = domTaskTitle.value.trim() || "Focus";
   const response = await chrome.runtime.sendMessage({
     type: "SAVE_TASK_PROFILE",
@@ -308,22 +319,51 @@ domTaskSaveProfileBtn.addEventListener("click", async () => {
       group: name.toLowerCase(),
       allowedDomains: splitDomainInput(domTaskDomains.value),
       blockedDomains: splitDomainInput(domTaskBlockedDomains.value),
-      defaultDuration: Number(domTaskDuration.value || 60)
+      defaultDurationMinutes: Number(domTaskDuration.value || 60)
     }
   });
 
+  if (response?.profiles) {
+    domTaskProfileSelect.innerHTML = [
+      ...response.profiles.map((profile) => `<option value="${profile.id}">${profile.name}</option>`),
+      '<option value="__new__">New profile...</option>'
+    ].join("");
+    if (response.profile?.id) {
+      domTaskProfileSelect.value = response.profile.id;
+    }
+  }
   domTaskSuggestion.textContent = `${response?.profile?.name || name}: profile saved`;
+});
+
+domTaskDeleteProfileBtn.addEventListener("click", async () => {
+  const profileId = domTaskProfileSelect.value;
+  if (!profileId || profileId === "__new__") {
+    return;
+  }
+
+  const response = await chrome.runtime.sendMessage({
+    type: "DELETE_TASK_PROFILE",
+    profileId
+  });
+  const profiles = response?.profiles || [];
+  domTaskProfileSelect.innerHTML = [
+    ...profiles.map((profile) => `<option value="${profile.id}">${profile.name}</option>`),
+    '<option value="__new__">New profile...</option>'
+  ].join("");
+  domTaskProfileSelect.value = profiles[0]?.id || "__new__";
+  fillProfile(profiles[0]);
+  domTaskSuggestion.textContent = profiles[0] ? "Profile deleted" : "No saved profiles";
 });
 
 domTaskStartBtn.addEventListener("click", async () => {
   const title = domTaskTitle.value.trim() || "Focus session";
   const response = await chrome.runtime.sendMessage({
     type: "START_TASK_SESSION",
-    profileId: domTaskProfileSelect.value || null,
+    profileId: domTaskProfileSelect.value === "__new__" ? null : domTaskProfileSelect.value || null,
     title,
     allowedDomains: splitDomainInput(domTaskDomains.value),
     blockedDomains: splitDomainInput(domTaskBlockedDomains.value),
-    defaultDuration: Number(domTaskDuration.value || 60)
+    defaultDurationMinutes: Number(domTaskDuration.value || 60)
   });
   renderTaskMode(response);
 });
