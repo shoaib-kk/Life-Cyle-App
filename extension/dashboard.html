@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LifeCycle Dashboard</title>
+  <link rel="stylesheet" href="dashboard.css" />
+</head>
+<body>
+  <header class="page-header">
+    <div>
+      <h1>Task Dashboard</h1>
+      <p>Focus time, session quality, and distractions by profile.</p>
+    </div>
+    <button id="refresh-btn" type="button">Refresh</button>
+  </header>
+
+  <main>
+    <section class="summary-grid">
+      <div class="summary-card">
+        <span class="label">Today</span>
+        <strong id="today-focus">0m</strong>
+      </div>
+      <div class="summary-card">
+        <span class="label">Week</span>
+        <strong id="week-focus">0m</strong>
+      </div>
+      <div class="summary-card">
+        <span class="label">Avg quality</span>
+        <strong id="avg-quality">-</strong>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Weekly Focus Time</h2>
+      </div>
+      <div class="bar-chart" id="weekly-chart"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Quality Trend</h2>
+      </div>
+      <div class="quality-list" id="quality-trend"></div>
+    </section>
+
+    <section class="two-column">
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Task Breakdown</h2>
+        </div>
+        <div class="list" id="task-breakdown"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">
+          <h2>Distractions By Profile</h2>
+        </div>
+        <div class="list" id="distractions"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>

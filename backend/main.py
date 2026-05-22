@@ -75,6 +75,16 @@ class TaskSessionPayload(BaseModel):
     overrideLog: list[dict] = Field(default_factory=list)
 
 
+class TaskProfilePayload(BaseModel):
+    id: str
+    name: str
+    allowedDomains: list[str] = Field(default_factory=list)
+    blockedDomains: list[str] = Field(default_factory=list)
+    defaultDurationMinutes: int = 60
+    createdAt: Optional[datetime] = None
+    updatedAt: Optional[datetime] = None
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
@@ -86,7 +96,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -163,6 +173,22 @@ def init_db() -> None:
                 distracting_domain_counts TEXT NOT NULL,
                 override_log TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_profiles (
+                user_id INTEGER NOT NULL,
+                profile_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                allowed_domains TEXT NOT NULL,
+                blocked_domains TEXT NOT NULL,
+                default_duration_minutes INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, profile_id),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             """
@@ -750,6 +776,100 @@ def read_usage_history(user: dict = Depends(current_user)) -> dict:
         history.setdefault(row["usage_date"], {})[row["domain"]] = round(float(row["minutes"]), 2)
 
     return {"history": history}
+
+
+@app.get("/task-profiles")
+def read_task_profiles(user: dict = Depends(current_user)) -> dict:
+    init_db()
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT profile_id, name, allowed_domains, blocked_domains,
+                   default_duration_minutes, created_at, updated_at
+            FROM task_profiles
+            WHERE user_id = ?
+            ORDER BY name ASC
+            """,
+            (user["id"],),
+        ).fetchall()
+
+    profiles = []
+    for row in rows:
+        profiles.append(
+            {
+                "id": row["profile_id"],
+                "name": row["name"],
+                "allowedDomains": json.loads(row["allowed_domains"] or "[]"),
+                "blockedDomains": json.loads(row["blocked_domains"] or "[]"),
+                "defaultDurationMinutes": int(row["default_duration_minutes"] or 60),
+                "createdAt": row["created_at"],
+                "updatedAt": row["updated_at"],
+            }
+        )
+
+    return {"profiles": profiles}
+
+
+@app.post("/task-profiles")
+def save_task_profile(payload: TaskProfilePayload, user: dict = Depends(current_user)) -> dict:
+    now = datetime.utcnow()
+    created_at = payload.createdAt or now
+    updated_at = payload.updatedAt or now
+
+    init_db()
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO task_profiles (
+                user_id, profile_id, name, allowed_domains, blocked_domains,
+                default_duration_minutes, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, profile_id)
+            DO UPDATE SET
+                name = excluded.name,
+                allowed_domains = excluded.allowed_domains,
+                blocked_domains = excluded.blocked_domains,
+                default_duration_minutes = excluded.default_duration_minutes,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user["id"],
+                payload.id,
+                payload.name.strip() or "Focus",
+                json.dumps(payload.allowedDomains),
+                json.dumps(payload.blockedDomains),
+                max(5, min(480, int(payload.defaultDurationMinutes or 60))),
+                created_at.isoformat(),
+                updated_at.isoformat(),
+            ),
+        )
+        connection.commit()
+
+    return {
+        "profile": {
+            "id": payload.id,
+            "name": payload.name.strip() or "Focus",
+            "allowedDomains": payload.allowedDomains,
+            "blockedDomains": payload.blockedDomains,
+            "defaultDurationMinutes": max(5, min(480, int(payload.defaultDurationMinutes or 60))),
+            "createdAt": created_at.isoformat(),
+            "updatedAt": updated_at.isoformat(),
+        }
+    }
+
+
+@app.delete("/task-profiles/{profile_id}")
+def delete_task_profile(profile_id: str, user: dict = Depends(current_user)) -> dict:
+    init_db()
+    with connect() as connection:
+        connection.execute(
+            "DELETE FROM task_profiles WHERE user_id = ? AND profile_id = ?",
+            (user["id"], profile_id),
+        )
+        connection.commit()
+
+    return {"deleted": True, "profileId": profile_id}
 
 
 @app.post("/task-sessions")

@@ -63,6 +63,7 @@ const domProfileAnalytics = $("profile-analytics");
 const domTaskSuggestBtn  = $("task-suggest-btn");
 const domTaskSaveProfileBtn = $("task-save-profile-btn");
 const domTaskDeleteProfileBtn = $("task-delete-profile-btn");
+const domTaskDashboardBtn = $("task-dashboard-btn");
 const domTaskStartBtn    = $("task-start-btn");
 const domTaskStopBtn     = $("task-stop-btn");
 
@@ -194,7 +195,7 @@ function fillProfile(profile) {
     domTaskDomains.value = "";
     domTaskBlockedDomains.value = "";
     domTaskDuration.value = 60;
-    domTaskSuggestion.textContent = "New profile";
+    domTaskSuggestion.textContent = "Create a reusable profile from the current task.";
     return;
   }
 
@@ -211,7 +212,7 @@ function renderTaskProfiles(raw) {
 
   domTaskProfileSelect.innerHTML = [
     ...profiles.map((profile) => `<option value="${profile.id}">${profile.name}</option>`),
-    '<option value="__new__">New profile...</option>'
+    '<option value="__new__">Create profile...</option>'
   ].join("");
 
   if (profiles.some((profile) => profile.id === previous)) {
@@ -326,18 +327,28 @@ domTaskSaveProfileBtn.addEventListener("click", async () => {
   if (response?.profiles) {
     domTaskProfileSelect.innerHTML = [
       ...response.profiles.map((profile) => `<option value="${profile.id}">${profile.name}</option>`),
-      '<option value="__new__">New profile...</option>'
+      '<option value="__new__">Create profile...</option>'
     ].join("");
     if (response.profile?.id) {
       domTaskProfileSelect.value = response.profile.id;
     }
   }
-  domTaskSuggestion.textContent = `${response?.profile?.name || name}: profile saved`;
+  domTaskSuggestion.textContent = "Saved";
+  setTimeout(() => {
+    if (domTaskSuggestion.textContent === "Saved") {
+      domTaskSuggestion.textContent = `${response?.profile?.name || name}: saved profile`;
+    }
+  }, 1400);
 });
 
 domTaskDeleteProfileBtn.addEventListener("click", async () => {
   const profileId = domTaskProfileSelect.value;
   if (!profileId || profileId === "__new__") {
+    return;
+  }
+  const profileName = domTaskProfileSelect.options[domTaskProfileSelect.selectedIndex]?.textContent || "this profile";
+
+  if (!confirm(`Delete "${profileName}"? This will not delete past session history.`)) {
     return;
   }
 
@@ -348,11 +359,15 @@ domTaskDeleteProfileBtn.addEventListener("click", async () => {
   const profiles = response?.profiles || [];
   domTaskProfileSelect.innerHTML = [
     ...profiles.map((profile) => `<option value="${profile.id}">${profile.name}</option>`),
-    '<option value="__new__">New profile...</option>'
+    '<option value="__new__">Create profile...</option>'
   ].join("");
   domTaskProfileSelect.value = profiles[0]?.id || "__new__";
   fillProfile(profiles[0]);
   domTaskSuggestion.textContent = profiles[0] ? "Profile deleted" : "No saved profiles";
+});
+
+domTaskDashboardBtn.addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("dashboard.html") });
 });
 
 domTaskStartBtn.addEventListener("click", async () => {

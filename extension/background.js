@@ -1,4 +1,4 @@
-const DEFAULT_BACKEND_URL = "https://yourdomain.com";
+﻿const DEFAULT_BACKEND_URL = "https://yourdomain.com";
 const AUTH_CALLBACK_PATH = "/extension-callback";
 const STORAGE_SCHEMA_VERSION = 1;
 const BASELINE_WEEKDAY_OCCURRENCES = 8;
@@ -296,12 +296,14 @@ async function saveTaskProfile(profile) {
   }
 
   await chrome.storage.local.set({ taskProfiles: profiles });
+  await syncTaskProfileToBackend(normalized);
   return { profiles, profile: normalized };
 }
 
 async function deleteTaskProfile(profileId) {
   const profiles = (await getTaskProfiles()).filter((profile) => profile.id !== profileId);
   await chrome.storage.local.set({ taskProfiles: profiles });
+  await deleteTaskProfileFromBackend(profileId);
   return { profiles };
 }
 
@@ -466,6 +468,53 @@ function profileAnalyticsFromHistory(history, profiles) {
   }
 
   return analytics;
+}
+
+async function buildTaskDashboardData() {
+  const profiles = await getTaskProfiles();
+  const history = await getTaskSessionHistory();
+  const analytics = profileAnalyticsFromHistory(history, profiles);
+  const now = Date.now();
+  const weekKeys = recentDateKeys(localDateKey(now), 7);
+  const weeklyFocusTrend = weekKeys.map((dateKey) => {
+    const minutes = history
+      .filter((session) => localDateKey(Number(session.endedAt || session.startedAt || now)) === dateKey)
+      .reduce((sum, session) => sum + Number(session.allowedMinutes || 0), 0);
+    return { date: dateKey, minutes: Math.round(minutes) };
+  });
+  const qualityTrend = history
+    .slice(-14)
+    .map((session) => ({
+      date: localDateKey(Number(session.endedAt || session.startedAt || now)),
+      score: Number(session.qualityScore || 0),
+      profileName: session.profileName || session.group || "Focus"
+    }));
+  const distractionsByProfile = Object.values(analytics).map((item) => ({
+    profileId: item.profileId,
+    profileName: item.profileName,
+    distractions: item.mostDistractingDomains || []
+  }));
+  const taskBreakdown = Object.values(analytics)
+    .map((item) => ({
+      profileId: item.profileId,
+      profileName: item.profileName,
+      minutes: item.totalFocusMinutes || 0,
+      sessionCount: item.sessionCount || 0,
+      averageSessionQuality: item.averageSessionQuality
+    }))
+    .sort((left, right) => right.minutes - left.minutes);
+
+  return {
+    generatedAt: new Date(now).toISOString(),
+    profiles,
+    analytics,
+    history,
+    todayFocusMinutes: weeklyFocusTrend[weeklyFocusTrend.length - 1]?.minutes || 0,
+    weeklyFocusTrend,
+    qualityTrend,
+    distractionsByProfile,
+    taskBreakdown
+  };
 }
 
 function taskSnapshot(taskSession) {
@@ -1993,6 +2042,172 @@ async function buildSummary() {
 const notificationCooldowns = {};
 // Tracks which tabs already have the overlay shown so we can update/hide it.
 const tabOverlayState = {};   // tabId -> { domain, shown, lastShownAt, lastThresholdKey }
+// Tracks profile suggestions to avoid spamming same profile multiple times.
+// Key: profileId, value: timestamp of last suggestion
+const profileSuggestionCooldowns = {};
+
+// ── Activity Detection & Profile Suggestions ──────────────────────────────────
+
+/**
+ * Analyzes open tabs to detect user activity
+ * Returns { detectedGroup, matchingProfile, confidence, matchedDomains }
+ */
+async function detectActivityFromTabs() {
+  try {
+    const windows = await chrome.windows.getAll({ windowTypes: ["normal", "popup"] });
+    const focusedWindow = windows.find(w => w.focused);
+    
+    if (!focusedWindow) return null;
+
+    const tabs = await chrome.tabs.query({ windowId: focusedWindow.id });
+    if (!tabs.length) return null;
+
+    // Extract domains from open tabs
+    const domains = new Set();
+    const tabTitles = [];
+    
+    tabs.forEach(tab => {
+      if (tab.url) {
+        const domain = normalizeDomain(tab.url);
+        if (domain) domains.add(domain);
+      }
+      if (tab.title) {
+        tabTitles.push(tab.title.toLowerCase());
+      }
+    });
+
+    if (!domains.size) return null;
+
+    const profiles = await getTaskProfiles();
+    const scoredProfiles = [];
+
+    // Score each profile based on how well it matches detected domains
+    for (const profile of profiles) {
+      let score = 0;
+      const matchedDomains = [];
+
+      // Check if allowed domains match open tabs
+      for (const domain of domains) {
+        if (isAllowedForTask(domain, profile.allowedDomains)) {
+          score += 10;
+          matchedDomains.push(domain);
+        }
+      }
+
+      // Check if profile group matches tab title/domain patterns
+      const matchingRule = TASK_GROUP_RULES.find(
+        rule => rule.group === profile.group
+      );
+      
+      if (matchingRule) {
+        // Check patterns against tab titles
+        const titleMatches = tabTitles.some(title =>
+          matchingRule.patterns.some(pattern => pattern.test(title))
+        );
+        if (titleMatches) score += 5;
+
+        // Check patterns against domains
+        const domainMatches = Array.from(domains).some(domain =>
+          matchingRule.domains.some(ruleDomain =>
+            domain === ruleDomain || domain.endsWith(`.${ruleDomain}`)
+          )
+        );
+        if (domainMatches) score += 5;
+      }
+
+      if (score > 0) {
+        scoredProfiles.push({
+          profile,
+          score,
+          matchedDomains,
+          group: profile.group
+        });
+      }
+    }
+
+    if (!scoredProfiles.length) return null;
+
+    // Sort by score and return the best match
+    scoredProfiles.sort((a, b) => b.score - a.score);
+    const best = scoredProfiles[0];
+
+    return {
+      detectedGroup: best.group,
+      matchingProfile: best.profile,
+      confidence: Math.min(best.score / 20, 1), // Normalize to 0-1
+      matchedDomains: best.matchedDomains
+    };
+  } catch (error) {
+    console.error("Activity detection failed:", error);
+    return null;
+  }
+}
+
+/**
+ * Checks if a profile should be suggested and creates a notification
+ */
+async function maybeSuggestProfile() {
+  try {
+    const { activeSession } = await getAppState();
+    
+    // Don't suggest if already tracking a task
+    if (activeSession?.taskProfileId) {
+      return;
+    }
+
+    const activity = await detectActivityFromTabs();
+    if (!activity) return;
+
+    const { matchingProfile, confidence } = activity;
+    
+    // Only suggest if confidence is reasonably high
+    if (confidence < 0.5) return;
+
+    const now = Date.now();
+    const COOLDOWN_MS = 60 * 60 * 1000; // 1 hour between suggestions for same profile
+
+    // Check if we've already suggested this profile recently
+    const lastSuggestion = profileSuggestionCooldowns[matchingProfile.id];
+    if (lastSuggestion && now - lastSuggestion < COOLDOWN_MS) {
+      return;
+    }
+
+    // Create a friendly message based on the detected activity
+    const activityName = matchingProfile.name;
+    const message = `Looks like you're ${activity.detectedGroup}. Start ${activityName} profile?`;
+
+    // Store the suggestion time
+    profileSuggestionCooldowns[matchingProfile.id] = now;
+
+    // Create the notification
+    const notificationId = `lifecycle-profile-suggest-${matchingProfile.id}`;
+    
+    chrome.notifications.create(notificationId, {
+      type: "basic",
+      iconUrl: "icon.png",
+      title: "LifeCycle — Profile Suggestion",
+      message: message,
+      priority: 1,
+      buttons: [
+        { title: "Start" },
+        { title: "Dismiss" }
+      ]
+    });
+
+    // Store the notification for click handling
+    await chrome.storage.local.get(async (data) => {
+      const pendingSuggestions = data.pendingProfileSuggestions || {};
+      pendingSuggestions[notificationId] = {
+        profileId: matchingProfile.id,
+        createdAt: now
+      };
+      await chrome.storage.local.set({ pendingProfileSuggestions: pendingSuggestions });
+    });
+
+  } catch (error) {
+    console.error("Profile suggestion failed:", error);
+  }
+}
 
 // ── Badge ─────────────────────────────────────────────────────────────────────
 
@@ -2297,6 +2512,104 @@ async function syncTaskSessionToBackend(sessionSummary) {
   }
 }
 
+async function syncTaskProfileToBackend(profile) {
+  const headers = await authHeaders();
+
+  if (!headers || !profile) {
+    return;
+  }
+
+  try {
+    const backendUrl = await getBackendUrl();
+    const response = await fetch(`${backendUrl}/task-profiles`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(profile)
+    });
+
+    if (response.status === 401) {
+      await clearAuthState("Session expired. Please sign in again.");
+    }
+  } catch (_error) {
+    // Profiles remain available locally if cloud sync fails.
+  }
+}
+
+async function deleteTaskProfileFromBackend(profileId) {
+  const headers = await authHeaders();
+
+  if (!headers || !profileId) {
+    return;
+  }
+
+  try {
+    const backendUrl = await getBackendUrl();
+    const response = await fetch(`${backendUrl}/task-profiles/${encodeURIComponent(profileId)}`, {
+      method: "DELETE",
+      headers
+    });
+
+    if (response.status === 401) {
+      await clearAuthState("Session expired. Please sign in again.");
+    }
+  } catch (_error) {
+    // Local deletion still stands; a later save will reconcile the profile list.
+  }
+}
+
+async function pullTaskProfilesFromBackend() {
+  const headers = await authHeaders();
+
+  if (!headers) {
+    return;
+  }
+
+  try {
+    const backendUrl = await getBackendUrl();
+    const response = await fetch(`${backendUrl}/task-profiles`, { headers });
+
+    if (response.status === 401) {
+      await clearAuthState("Session expired. Please sign in again.");
+      return;
+    }
+
+    if (!response.ok) {
+      return;
+    }
+
+    const { profiles: remoteProfiles = [] } = await response.json();
+    if (!Array.isArray(remoteProfiles) || remoteProfiles.length === 0) {
+      return;
+    }
+
+    const localProfiles = await getTaskProfiles();
+    const byId = new Map(localProfiles.map((profile) => [profile.id, profile]));
+
+    for (const remoteProfile of remoteProfiles) {
+      const normalized = normalizeTaskProfile(remoteProfile);
+      const localProfile = byId.get(normalized.id);
+      const localUpdated = Date.parse(localProfile?.updatedAt || 0);
+      const remoteUpdated = Date.parse(normalized.updatedAt || 0);
+
+      if (!localProfile || remoteUpdated >= localUpdated) {
+        byId.set(normalized.id, normalized);
+      }
+    }
+
+    await chrome.storage.local.set({ taskProfiles: Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name)) });
+  } catch (_error) {
+    // Local profiles are enough for MVP when the backend is unavailable.
+  }
+}
+
+async function syncAllTaskProfilesToBackend() {
+  const profiles = await getTaskProfiles();
+
+  for (const profile of profiles) {
+    await syncTaskProfileToBackend(profile);
+  }
+}
+
 async function handleAuthCallback(tabId, rawUrl) {
   let url;
 
@@ -2327,6 +2640,8 @@ async function handleAuthCallback(tabId, rawUrl) {
     authError: ""
   });
   await pullFromBackend();
+  await pullTaskProfilesFromBackend();
+  await syncAllTaskProfilesToBackend();
   await syncTodayToBackend({ force: true });
 
   try {
@@ -2595,9 +2910,12 @@ async function clearAllData() {
 chrome.runtime.onInstalled.addListener(() => {
   chrome.idle.setDetectionInterval(IDLE_DETECTION_SECONDS);
   chrome.alarms.create("lifecycle-checkpoint", { periodInMinutes: 1 });
+  chrome.alarms.create("lifecycle-suggest-profile", { periodInMinutes: 5 });
   enqueue(async () => {
     await migrateStorage();
     await pullFromBackend();
+    await pullTaskProfilesFromBackend();
+    await syncAllTaskProfilesToBackend();
     await refreshActiveContext();
   });
 });
@@ -2605,9 +2923,12 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.runtime.onStartup.addListener(() => {
   chrome.idle.setDetectionInterval(IDLE_DETECTION_SECONDS);
   chrome.alarms.create("lifecycle-checkpoint", { periodInMinutes: 1 });
+  chrome.alarms.create("lifecycle-suggest-profile", { periodInMinutes: 5 });
   enqueue(async () => {
     await migrateStorage();
     await pullFromBackend();
+    await pullTaskProfilesFromBackend();
+    await syncAllTaskProfilesToBackend();
     await refreshActiveContext();
   });
 });
@@ -2624,6 +2945,8 @@ chrome.idle.onStateChanged.addListener((state) => {
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "lifecycle-checkpoint") {
     enqueue(refreshActiveContext);
+  } else if (alarm.name === "lifecycle-suggest-profile") {
+    enqueue(maybeSuggestProfile);
   }
 });
 
@@ -2634,7 +2957,11 @@ chrome.tabs.onActivated.addListener(({ tabId }) => {
   chrome.tabs.get(tabId, (tab) => {
     if (chrome.runtime.lastError) return;
     if (tab?.url?.startsWith("chrome-extension://")) return;
-    enqueue(refreshActiveContext);
+    enqueue(async () => {
+      await refreshActiveContext();
+      // Suggest a profile based on detected activity
+      await maybeSuggestProfile();
+    });
   });
 });
 
@@ -2672,6 +2999,66 @@ chrome.windows.onRemoved.addListener(() => {
   enqueue(refreshActiveContext);
 });
 
+// ── Notification handlers ─────────────────────────────────────────────────────
+
+chrome.notifications.onClicked.addListener((notificationId) => {
+  // Handle profile suggestion notification click
+  if (notificationId.startsWith("lifecycle-profile-suggest-")) {
+    enqueue(async () => {
+      const { pendingProfileSuggestions = {} } = await chrome.storage.local.get({
+        pendingProfileSuggestions: {}
+      });
+      
+      const suggestion = pendingProfileSuggestions[notificationId];
+      if (suggestion?.profileId) {
+        await startTaskSession({
+          profileId: suggestion.profileId
+        });
+      }
+      
+      // Clean up the notification
+      delete pendingProfileSuggestions[notificationId];
+      await chrome.storage.local.set({ pendingProfileSuggestions });
+    });
+  }
+});
+
+chrome.notifications.onButtonClicked.addListener((notificationId, buttonIndex) => {
+  // Handle profile suggestion button clicks
+  if (notificationId.startsWith("lifecycle-profile-suggest-")) {
+    if (buttonIndex === 0) {
+      // "Start" button clicked - same as notification click
+      enqueue(async () => {
+        const { pendingProfileSuggestions = {} } = await chrome.storage.local.get({
+          pendingProfileSuggestions: {}
+        });
+        
+        const suggestion = pendingProfileSuggestions[notificationId];
+        if (suggestion?.profileId) {
+          await startTaskSession({
+            profileId: suggestion.profileId
+          });
+        }
+        
+        // Clean up the notification
+        delete pendingProfileSuggestions[notificationId];
+        await chrome.storage.local.set({ pendingProfileSuggestions });
+      });
+    } else if (buttonIndex === 1) {
+      // "Dismiss" button clicked - just close the notification
+      enqueue(async () => {
+        const { pendingProfileSuggestions = {} } = await chrome.storage.local.get({
+          pendingProfileSuggestions: {}
+        });
+        
+        // Clean up the notification
+        delete pendingProfileSuggestions[notificationId];
+        await chrome.storage.local.set({ pendingProfileSuggestions });
+      });
+    }
+  }
+});
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const handlers = {
     SAVE_SETTINGS: async () => {
@@ -2700,7 +3087,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     STOP_TASK_SESSION: stopTaskSession,
     TASK_EMERGENCY_OVERRIDE: taskOverrideCurrentTab,
     SAVE_TASK_PROFILE: saveTaskProfileFromMessage,
-    DELETE_TASK_PROFILE: deleteTaskProfileFromMessage
+    DELETE_TASK_PROFILE: deleteTaskProfileFromMessage,
+    GET_TASK_DASHBOARD: buildTaskDashboardData
   };
 
   const handler = handlers[message?.type];

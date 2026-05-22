@@ -422,6 +422,11 @@ body {
   color: var(--col-danger-text);
 }
 
+.dashboard-btn {
+  width: 100%;
+  margin-top: 6px;
+}
+
 .task-metrics {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
