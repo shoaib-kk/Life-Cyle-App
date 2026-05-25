@@ -7,162 +7,52 @@
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
-
-  <!-- TOP BAR: active domain + status badge + gear -->
-  <div class="top-bar" id="top-bar">
-    <div class="domain-row">
+  <header class="popup-header">
+    <div class="site-chip">
       <div class="favicon" id="favicon"></div>
-      <span class="domain-name" id="domain-name">No active tab</span>
-    </div>
-    <div class="top-bar-right">
-      <span class="badge" id="status-badge"></span>
-      <button class="gear-btn" id="gear-btn" title="Settings" aria-label="Settings">
-        <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z" fill="currentColor"/>
-          <path fill-rule="evenodd" clip-rule="evenodd" d="M6.56 1.31a.75.75 0 0 1 .73-.56h1.42c.34 0 .63.23.72.55l.28 1.02c.3.1.59.23.86.39l.97-.44a.75.75 0 0 1 .88.17l1 1a.75.75 0 0 1 .14.88l-.46.96c.16.27.29.55.39.85l1.02.28c.32.09.55.38.55.72v1.42a.75.75 0 0 1-.56.73l-1.02.28a4.73 4.73 0 0 1-.39.86l.44.97a.75.75 0 0 1-.17.88l-1 1a.75.75 0 0 1-.88.14l-.96-.46c-.27.16-.55.29-.85.39l-.28 1.02a.75.75 0 0 1-.72.55H7.27a.75.75 0 0 1-.73-.56l-.28-1.02a4.73 4.73 0 0 1-.86-.39l-.97.44a.75.75 0 0 1-.88-.17l-1-1a.75.75 0 0 1-.14-.88l.46-.96a4.73 4.73 0 0 1-.39-.85L1.46 9.4A.75.75 0 0 1 .91 8.7V7.27a.75.75 0 0 1 .56-.73l1.02-.28c.1-.3.23-.59.39-.86l-.44-.97a.75.75 0 0 1 .17-.88l1-1a.75.75 0 0 1 .88-.14l.96.46c.27-.16.55-.29.85-.39L6.56 1.3ZM8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z" fill="currentColor" opacity="0.4"/>
-        </svg>
-      </button>
-    </div>
-  </div>
-
-  <!-- SETTINGS PANEL (hidden by default) -->
-  <div class="settings-panel" id="settings-panel">
-    <div class="settings-heading">Theme</div>
-    <div class="theme-grid">
-      <label class="theme-swatch">
-        <input type="radio" name="theme" value="default" checked />
-        <div class="swatch-circle swatch-default"></div>
-        <span class="swatch-label">Default</span>
-      </label>
-      <label class="theme-swatch">
-        <input type="radio" name="theme" value="dark" />
-        <div class="swatch-circle swatch-dark"></div>
-        <span class="swatch-label">Dark</span>
-      </label>
-      <label class="theme-swatch">
-        <input type="radio" name="theme" value="forest" />
-        <div class="swatch-circle swatch-forest"></div>
-        <span class="swatch-label">Forest</span>
-      </label>
-      <label class="theme-swatch">
-        <input type="radio" name="theme" value="dusk" />
-        <div class="swatch-circle swatch-dusk"></div>
-        <span class="swatch-label">Dusk</span>
-      </label>
-      <label class="theme-swatch">
-        <input type="radio" name="theme" value="sand" />
-        <div class="swatch-circle swatch-sand"></div>
-        <span class="swatch-label">Sand</span>
-      </label>
-    </div>
-    <div class="settings-divider"></div>
-    <div class="settings-row">
-      <span class="settings-row-label">Daily reset at</span>
-      <select id="reset-select">
-        <option value="midnight">Midnight</option>
-        <option value="3am">3 am</option>
-      </select>
-    </div>
-    <div class="settings-divider"></div>
-    <div class="settings-row">
-      <span class="settings-row-label">Notifications</span>
-      <label class="toggle-switch">
-        <input type="checkbox" id="notif-toggle" />
-        <span class="toggle-track"><span class="toggle-thumb"></span></span>
-      </label>
-    </div>
-    <div class="settings-row" style="margin-top:6px">
-      <span class="settings-row-label">In-page overlay</span>
-      <label class="toggle-switch">
-        <input type="checkbox" id="overlay-toggle" />
-        <span class="toggle-track"><span class="toggle-thumb"></span></span>
-      </label>
-    </div>
-    <div class="settings-divider"></div>
-    <div class="settings-row auth-row">
-      <span class="settings-row-label">Account</span>
-      <div class="auth-actions">
-        <button class="auth-btn" id="login-btn" type="button">Sign in</button>
-        <button class="auth-btn secondary" id="signout-btn" type="button">Sign out</button>
+      <div>
+        <div class="eyebrow">Current site</div>
+        <div class="domain" id="domain-name">No active tab</div>
       </div>
     </div>
-    <div class="auth-status" id="auth-status"></div>
-  </div>
+    <button class="icon-btn" id="refresh-btn" type="button" title="Refresh" aria-label="Refresh">R</button>
+  </header>
 
-  <!-- TOTAL SCREEN TIME BANNER -->
-  <div class="total-bar">
-    <span class="total-label">Total screen time today</span>
-    <span class="total-value" id="total-screen-time">—</span>
-  </div>
+  <main>
+    <section class="metric-grid" aria-label="Quick stats">
+      <div class="metric-card">
+        <span>Site today</span>
+        <strong id="current-site-time">-</strong>
+      </div>
+      <div class="metric-card">
+        <span>Today total</span>
+        <strong id="today-total">-</strong>
+      </div>
+    </section>
 
-  <div class="onboarding" id="onboarding"></div>
+    <section class="task-card">
+      <div class="section-row">
+        <span class="eyebrow">Task profile</span>
+        <span class="status-pill" id="task-status">Off</span>
+      </div>
+      <select id="profile-select" aria-label="Task profile"></select>
+      <div class="session-row">
+        <span>Session</span>
+        <strong id="session-duration">0m</strong>
+      </div>
+      <div class="button-row">
+        <button class="primary" id="start-btn" type="button">Start</button>
+        <button id="stop-btn" type="button">Stop</button>
+      </div>
+    </section>
 
-  <div class="task-panel" id="task-panel">
-    <div class="task-header">
-      <span class="section-title">Task mode</span>
-      <span class="task-status" id="task-status">Off</span>
-    </div>
-    <div class="task-profile-row">
-      <select class="task-profile-select" id="task-profile-select"></select>
-      <input class="task-duration" id="task-duration" type="number" min="5" max="480" step="5" value="60" title="Default duration in minutes" />
-    </div>
-    <input class="task-input" id="task-title" type="text" placeholder="Study probability" />
-    <div class="task-suggestion" id="task-suggestion"></div>
-    <textarea class="task-domains" id="task-domains" rows="3" placeholder="Allowed domains, one per line"></textarea>
-    <textarea class="task-domains" id="task-blocked-domains" rows="2" placeholder="Blocked domains, one per line"></textarea>
-    <div class="task-actions">
-      <button class="task-btn" id="task-suggest-btn" type="button">Suggest</button>
-      <button class="task-btn" id="task-save-profile-btn" type="button">Save profile</button>
-      <button class="task-btn danger" id="task-delete-profile-btn" type="button">Delete</button>
-      <button class="task-btn primary" id="task-start-btn" type="button">Start</button>
-      <button class="task-btn danger" id="task-stop-btn" type="button">Stop</button>
-    </div>
-    <button class="task-btn dashboard-btn" id="task-dashboard-btn" type="button">Open dashboard</button>
-    <div class="task-metrics" id="task-metrics"></div>
-    <div class="profile-analytics" id="profile-analytics"></div>
-  </div>
+    <section class="recommendation" id="recommendation"></section>
+  </main>
 
-  <!-- STAT GRID: today / avg / predicted -->
-  <div class="stat-grid">
-    <div class="stat-cell">
-      <div class="stat-num" id="stat-today">—</div>
-      <div class="stat-lbl">Today</div>
-    </div>
-    <div class="stat-cell">
-      <div class="stat-num" id="stat-avg">—</div>
-      <div class="stat-lbl" id="stat-avg-lbl">Avg</div>
-    </div>
-    <div class="stat-cell">
-      <div class="stat-num" id="stat-predicted">—</div>
-      <div class="stat-lbl">Predicted</div>
-    </div>
-  </div>
-
-  <!-- SESSION BAR -->
-  <div class="session-section" id="session-section">
-    <div class="session-header">
-      <span class="section-title">Current session</span>
-      <span class="session-meta" id="session-meta"></span>
-    </div>
-    <div class="progress-track">
-      <div class="progress-fill" id="session-fill"></div>
-    </div>
-    <div class="session-caption" id="session-caption"></div>
-  </div>
-
-  <!-- RECOMMENDATION -->
-  <div class="recommendation" id="recommendation"></div>
-
-  <!-- SITES LIST -->
-  <div class="sites-section">
-    <div class="section-title" style="padding: 10px 14px 6px;">Today's sites</div>
-    <div class="sites-list" id="sites-list"></div>
-  </div>
-
-  <!-- FOOTER: confidence -->
-  <div class="footer">
-    <div class="confidence-row" id="confidence-row"></div>
-  </div>
+  <footer>
+    <button id="dashboard-btn" type="button">Dashboard</button>
+    <button id="login-btn" type="button">Sign in</button>
+  </footer>
 
   <script src="popup.js"></script>
 </body>

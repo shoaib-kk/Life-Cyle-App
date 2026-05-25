@@ -1,4 +1,4 @@
-﻿const DEFAULT_BACKEND_URL = "https://yourdomain.com";
+﻿const DEFAULT_BACKEND_URL = "http://127.0.0.1:8000";
 const AUTH_CALLBACK_PATH = "/extension-callback";
 const STORAGE_SCHEMA_VERSION = 1;
 const BASELINE_WEEKDAY_OCCURRENCES = 8;
@@ -1019,17 +1019,24 @@ async function saveCompletedSession(activeSession, endedAt, reasonEnded = "tab_c
 
   const sessions = await getSessions();
   const safeReason = SESSION_END_REASONS.has(reasonEnded) ? reasonEnded : "tab_change";
-  sessions.push({
+  const taskSession = await getTaskSession();
+  const { domainCategories } = await getAppState();
+  const sessionSummary = {
+    externalId: `${activeSession.domain}:${toIsoString(startedAt)}:${toIsoString(endedAt)}:${safeReason}`,
     domain: activeSession.domain,
+    category: categoryForDomain(activeSession.domain, domainCategories),
+    profileId: taskSession?.profileId || null,
     startedAt: toIsoString(startedAt),
     endedAt: toIsoString(endedAt),
     durationMinutes,
     reasonEnded: safeReason
-  });
+  };
+  sessions.push(sessionSummary);
 
   await chrome.storage.local.set({
     sessions: pruneSessionHistory(sessions)
   });
+  await syncUsageSessionToBackend(sessionSummary);
 }
 
 async function saveCompletedSessionIfGapElapsed(activeSession, timestamp, reasonEnded = "tab_change") {
@@ -2347,6 +2354,68 @@ async function updateOverlay(tabId, domain, domainMins, averageMinutes, sessionM
   }
 }
 
+async function syncUsageSessionToBackend(sessionSummary) {
+  const headers = await authHeaders();
+
+  if (!headers || !sessionSummary?.domain) {
+    return;
+  }
+
+  try {
+    const backendUrl = await getBackendUrl();
+    const response = await fetch(`${backendUrl}/usage-sessions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        externalId: sessionSummary.externalId,
+        domain: sessionSummary.domain,
+        category: sessionSummary.category,
+        profileId: sessionSummary.profileId,
+        startedAt: sessionSummary.startedAt,
+        endedAt: sessionSummary.endedAt,
+        durationMinutes: sessionSummary.durationMinutes,
+        reasonEnded: sessionSummary.reasonEnded,
+        source: "extension"
+      })
+    });
+
+    if (response.status === 401) {
+      await clearAuthState("Session expired. Please sign in again.");
+    }
+  } catch (_error) {
+    // Session-level sync is best-effort; daily aggregate sync still runs.
+  }
+}
+
+async function syncDomainCategoryToBackend(domain, category, profileId = null) {
+  const headers = await authHeaders();
+
+  if (!headers || !domain) {
+    return;
+  }
+
+  try {
+    const backendUrl = await getBackendUrl();
+    const response = await fetch(`${backendUrl}/domain-categories`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        domain,
+        category,
+        productivity: category,
+        profileId,
+        source: "extension"
+      })
+    });
+
+    if (response.status === 401) {
+      await clearAuthState("Session expired. Please sign in again.");
+    }
+  } catch (_error) {
+    // Local category settings remain useful without backend connectivity.
+  }
+}
+
 async function syncTodayToBackend(options = {}) {
   const now = Date.now();
   const force = Boolean(options.force);
@@ -2838,6 +2907,7 @@ async function setCurrentSiteCategory(category) {
       [currentDomain]: normalizeCategory(category)
     }
   });
+  await syncDomainCategoryToBackend(currentDomain, normalizeCategory(category));
 
   return buildSummary();
 }
