@@ -1,6 +1,16 @@
 "use strict";
 
 const WEB_DASHBOARD_URL = "http://localhost:5173";
+const CATEGORY_KEYS = ["neutral", "productive", "distracting"];
+const DEFAULT_DOMAIN_CATEGORIES = {
+  "chatgpt.com": "productive",
+  "github.com": "productive",
+  "docs.google.com": "productive",
+  "youtube.com": "distracting",
+  "reddit.com": "distracting",
+  "instagram.com": "distracting",
+  "gmail.com": "neutral"
+};
 const $ = (id) => document.getElementById(id);
 
 const els = {
@@ -16,7 +26,9 @@ const els = {
   stopBtn: $("stop-btn"),
   dashboardBtn: $("dashboard-btn"),
   loginBtn: $("login-btn"),
-  refreshBtn: $("refresh-btn")
+  refreshBtn: $("refresh-btn"),
+  exportBtn: $("export-btn"),
+  rankedList: $("ranked-list")
 };
 
 let latestSummary = null;
@@ -48,6 +60,11 @@ function setFavicon(domain) {
   image.src = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=32`;
 }
 
+function categoryForDomain(domain, domainCategories = {}) {
+  const value = domainCategories[domain] || DEFAULT_DOMAIN_CATEGORIES[domain] || "neutral";
+  return CATEGORY_KEYS.includes(value) ? value : "neutral";
+}
+
 function selectedProfile() {
   const profiles = latestSummary?.taskProfiles || [];
   return profiles.find((profile) => profile.id === els.profileSelect.value) || profiles[0] || null;
@@ -74,6 +91,35 @@ function renderProfiles(summary) {
   if (profiles.some((profile) => profile.id === nextValue)) {
     els.profileSelect.value = nextValue;
   }
+}
+
+function renderRankedList(summary) {
+  const usage = summary.usage || {};
+  const categories = summary.domainCategories || {};
+  const entries = Object.entries(usage)
+    .map(([domain, minutes]) => ({
+      domain,
+      minutes: Number(minutes || 0),
+      category: categoryForDomain(domain, categories)
+    }))
+    .filter((entry) => entry.minutes > 0)
+    .sort((left, right) => right.minutes - left.minutes)
+    .slice(0, 5);
+
+  if (!entries.length) {
+    els.rankedList.innerHTML = '<div class="ranked-item"><span></span><span class="ranked-domain">No tracked domains yet</span><span class="ranked-minutes">-</span></div>';
+    return;
+  }
+
+  els.rankedList.innerHTML = entries
+    .map((entry) => `
+      <div class="ranked-item">
+        <span class="category-dot ${entry.category}" title="${entry.category}"></span>
+        <span class="ranked-domain">${entry.domain}</span>
+        <span class="ranked-minutes">${fmtMinutes(entry.minutes)}</span>
+      </div>
+    `)
+    .join("");
 }
 
 function recommendationFor(summary) {
@@ -112,6 +158,7 @@ function render(summary) {
   els.todayTotal.textContent = fmtMinutes(totalToday);
 
   renderProfiles(summary);
+  renderRankedList(summary);
 
   const currentTask = summary.taskMode?.current || null;
   els.taskStatus.textContent = currentTask?.profileName || currentTask?.group || "Off";
@@ -174,6 +221,21 @@ els.loginBtn.addEventListener("click", async () => {
 });
 
 els.refreshBtn.addEventListener("click", refresh);
+
+els.exportBtn.addEventListener("click", async () => {
+  const data = await chrome.storage.local.get(null);
+  const blob = new Blob([JSON.stringify(data, null, 2)], {
+    type: "application/json"
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `lifecycle-export-${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
 
 refresh();
 const timer = setInterval(refresh, 1000);

@@ -92,7 +92,8 @@ main {
 
 .metric-card,
 .task-card,
-.recommendation {
+.recommendation,
+.ranked-card {
   border: 1px solid #e2e8f0;
   border-radius: 8px;
   background: #ffffff;
@@ -202,6 +203,54 @@ button:disabled {
   padding: 11px 12px;
   color: #4b5563;
   line-height: 1.45;
+}
+
+.ranked-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.ranked-list {
+  display: grid;
+  gap: 6px;
+}
+
+.ranked-item {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.category-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #94a3b8;
+}
+
+.category-dot.productive {
+  background: #16a34a;
+}
+
+.category-dot.distracting {
+  background: #dc2626;
+}
+
+.ranked-domain {
+  overflow: hidden;
+  color: #1f2937;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ranked-minutes {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
 }
 
 footer {

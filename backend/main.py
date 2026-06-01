@@ -12,28 +12,41 @@ import secrets
 import sqlite3
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
+from uuid import uuid4
 
+from dotenv import load_dotenv
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import text
+from sqlalchemy.orm import Session as SqlAlchemySession
+
+from backend.database import DB_PATH as SQLALCHEMY_DB_PATH
+from backend.database import SessionLocal, ensure_sqlalchemy_schema
+from backend.models import BrowsingSession, Category, DailyUsage
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env")
 BASELINE_WEEKDAY_OCCURRENCES = 8
 FULL_DAY_MINUTES = 24 * 60
 ABOVE_BASELINE_THRESHOLD = 0.3
 MIN_BASELINE_RECORDS = 2
 MIN_TRACKED_DAY_MINUTES_FOR_PREDICTION = 30
 MIN_DOMAIN_MINUTES_FOR_PREDICTION = 10
-DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "lifecycle.db"
-DB_PATH = Path(os.environ.get("LIFECYCLE_DB_PATH", DEFAULT_DB_PATH))
+DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "lifecycle.db"
+DB_PATH = SQLALCHEMY_DB_PATH
 APP_ENV = os.environ.get("LIFECYCLE_ENV", "development").lower()
 AUTH_SECRET = os.environ.get("LIFECYCLE_AUTH_SECRET")
 ALLOWED_ORIGINS = [
     origin.strip()
-    for origin in os.environ.get(
-        "LIFECYCLE_ALLOWED_ORIGINS",
-        "http://127.0.0.1:8000,http://localhost:8000,http://127.0.0.1:5173,http://localhost:5173",
+    for origin in (
+        os.environ.get("LIFECYCLE_CORS_ORIGINS")
+        or os.environ.get(
+            "LIFECYCLE_ALLOWED_ORIGINS",
+            "http://127.0.0.1:8000,http://localhost:8000,http://127.0.0.1:5173,http://localhost:5173",
+        )
     ).split(",")
     if origin.strip()
 ]
@@ -50,6 +63,30 @@ class UsagePayload(BaseModel):
     date: Optional[Date] = None
     usage: Dict[str, float] = Field(default_factory=dict)
     tracked: bool = True
+
+
+class LocalSessionPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: Optional[str] = None
+    externalId: Optional[str] = None
+    domain: str
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    startTime: Optional[datetime] = None
+    endTime: Optional[datetime] = None
+    startedAt: Optional[datetime] = None
+    endedAt: Optional[datetime] = None
+    duration_minutes: Optional[float] = None
+    durationMinutes: Optional[float] = None
+
+
+class LocalSessionBatchPayload(BaseModel):
+    sessions: list[LocalSessionPayload] = Field(default_factory=list)
+
+
+class CategoryUpdatePayload(BaseModel):
+    category: str = "neutral"
 
 
 class AuthPayload(BaseModel):
@@ -140,7 +177,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -158,6 +195,14 @@ def connect() -> sqlite3.Connection:
     return connection
 
 
+def get_db():
+    database = SessionLocal()
+    try:
+        yield database
+    finally:
+        database.close()
+
+
 def ensure_column(
     connection: sqlite3.Connection,
     table: str,
@@ -173,6 +218,7 @@ def ensure_column(
 
 
 def init_db() -> None:
+    ensure_sqlalchemy_schema()
     with connect() as connection:
         connection.execute(
             """
@@ -249,17 +295,6 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, profile_id),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS daily_usage (
-                usage_date TEXT NOT NULL,
-                domain TEXT NOT NULL,
-                minutes REAL NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (usage_date, domain)
             )
             """
         )
@@ -454,6 +489,12 @@ def current_user(authorization: Optional[str] = Header(default=None)) -> dict:
     return {"id": user["id"], "email": user["email"]}
 
 
+def optional_current_user(authorization: Optional[str] = Header(default=None)) -> Optional[dict]:
+    if not authorization:
+        return None
+    return current_user(authorization)
+
+
 def previous_same_weekday_dates(value: Date, occurrences: int) -> list[Date]:
     return [value - timedelta(days=offset * 7) for offset in range(1, occurrences + 1)]
 
@@ -542,7 +583,7 @@ def usage_for_date(connection: sqlite3.Connection, value: Date, user_id: Optiona
         ).fetchall()
     else:
         rows = connection.execute(
-            "SELECT domain, minutes FROM daily_usage WHERE usage_date = ? ORDER BY minutes DESC",
+            "SELECT domain, minutes FROM daily_usage WHERE date = ? ORDER BY minutes DESC",
             (date_key(value),),
         ).fetchall()
     return {row["domain"]: round(float(row["minutes"]), 2) for row in rows}
@@ -556,7 +597,7 @@ def tracked_total_for_date(connection: sqlite3.Connection, value: Date, user_id:
         ).fetchone()
     else:
         row = connection.execute(
-            "SELECT SUM(minutes) AS total FROM daily_usage WHERE usage_date = ?",
+            "SELECT SUM(minutes) AS total FROM daily_usage WHERE date = ?",
             (date_key(value),),
         ).fetchone()
     return float(row["total"] or 0)
@@ -605,9 +646,9 @@ def baseline_for_domain(
     else:
         rows = connection.execute(
             f"""
-            SELECT usage_date, minutes
+            SELECT date AS usage_date, minutes
             FROM daily_usage
-            WHERE domain = ? AND usage_date IN ({placeholders})
+            WHERE domain = ? AND date IN ({placeholders})
             """,
             (domain, *keys),
         ).fetchall()
@@ -777,6 +818,42 @@ def clamp_number(value: float, lower: float, upper: float) -> float:
 
 def seconds_between(started_at: datetime, ended_at: datetime) -> float:
     return max(0.0, (ended_at - started_at).total_seconds())
+
+
+def local_category_record(category: Category) -> dict:
+    return {"domain": category.domain, "category": normalize_productivity(category.category)}
+
+
+def local_session_times(payload: LocalSessionPayload) -> tuple[datetime, datetime]:
+    started_at = payload.start_time or payload.startTime or payload.startedAt
+    ended_at = payload.end_time or payload.endTime or payload.endedAt
+
+    if not started_at or not ended_at:
+        raise HTTPException(status_code=400, detail="Session start and end times are required")
+
+    if ended_at <= started_at:
+        raise HTTPException(status_code=400, detail="Session end time must be after start time")
+
+    return started_at, ended_at
+
+
+def local_session_duration(payload: LocalSessionPayload, started_at: datetime, ended_at: datetime) -> float:
+    value = payload.duration_minutes
+    if value is None:
+        value = payload.durationMinutes
+    if value is None:
+        value = seconds_between(started_at, ended_at) / 60
+    return round(max(0.0, float(value)), 2)
+
+
+def local_session_record(session: BrowsingSession) -> dict:
+    return {
+        "id": session.id,
+        "domain": session.domain,
+        "start_time": session.start_time.isoformat(),
+        "end_time": session.end_time.isoformat(),
+        "duration_minutes": round(float(session.duration_minutes or 0), 2),
+    }
 
 
 def date_keys_between(start_date: Date, end_date: Date) -> list[str]:
@@ -1453,43 +1530,75 @@ def logout(_user: dict = Depends(current_user)) -> dict:
 
 
 @app.post("/usage")
-def save_usage(payload: UsagePayload, user: dict = Depends(current_user)) -> dict:
+def save_usage(
+    payload: UsagePayload,
+    user: Optional[dict] = Depends(optional_current_user),
+    database: SqlAlchemySession = Depends(get_db),
+) -> dict:
     usage_date = payload.date or Date.today()
     clean_usage = {
-        domain.strip().lower(): max(0.0, float(minutes))
+        normalize_domain_name(domain): max(0.0, float(minutes))
         for domain, minutes in payload.usage.items()
         if domain.strip()
     }
 
     init_db()
-    with connect() as connection:
-        now = datetime.utcnow().isoformat(timespec="seconds")
-        user_id = user["id"]
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    user_id = user["id"] if user else None
+
+    if user_id:
+        with connect() as connection:
+            if payload.tracked:
+                connection.execute(
+                    """
+                    INSERT INTO user_tracked_dates (user_id, usage_date, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, usage_date)
+                    DO UPDATE SET updated_at = excluded.updated_at
+                    """,
+                    (user_id, date_key(usage_date), now),
+                )
+
+            for domain, minutes in clean_usage.items():
+                connection.execute(
+                    """
+                    INSERT INTO user_daily_usage (user_id, usage_date, domain, minutes, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, usage_date, domain)
+                    DO UPDATE SET minutes = excluded.minutes, updated_at = excluded.updated_at
+                    """,
+                    (user_id, date_key(usage_date), domain, round(minutes, 2), now),
+                )
+
+            connection.commit()
+            insights = compute_insights(connection, usage_date, BASELINE_WEEKDAY_OCCURRENCES, user_id)
+    else:
+        for domain, minutes in clean_usage.items():
+            database.merge(
+                DailyUsage(
+                    date=date_key(usage_date),
+                    domain=domain,
+                    minutes=round(minutes, 2),
+                    has_tracking_coverage=bool(payload.tracked),
+                )
+            )
 
         if payload.tracked:
-            connection.execute(
-                """
-                INSERT INTO user_tracked_dates (user_id, usage_date, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id, usage_date)
-                DO UPDATE SET updated_at = excluded.updated_at
-                """,
-                (user_id, date_key(usage_date), now),
+            database.execute(
+                text(
+                    """
+                    INSERT INTO tracked_dates (usage_date, updated_at)
+                    VALUES (:usage_date, :updated_at)
+                    ON CONFLICT(usage_date)
+                    DO UPDATE SET updated_at = excluded.updated_at
+                    """
+                ),
+                {"usage_date": date_key(usage_date), "updated_at": now},
             )
 
-        for domain, minutes in clean_usage.items():
-            connection.execute(
-                """
-                INSERT INTO user_daily_usage (user_id, usage_date, domain, minutes, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, usage_date, domain)
-                DO UPDATE SET minutes = excluded.minutes, updated_at = excluded.updated_at
-                """,
-                (user_id, date_key(usage_date), domain, round(minutes, 2), now),
-            )
-
-        connection.commit()
-        insights = compute_insights(connection, usage_date, BASELINE_WEEKDAY_OCCURRENCES, user_id)
+        database.commit()
+        with connect() as connection:
+            insights = compute_insights(connection, usage_date, BASELINE_WEEKDAY_OCCURRENCES)
 
     return {
         "date": date_key(usage_date),
@@ -1501,35 +1610,104 @@ def save_usage(payload: UsagePayload, user: dict = Depends(current_user)) -> dic
 @app.get("/usage")
 def read_usage_by_query(
     usage_date: Optional[Date] = Query(default=None, alias="date"),
-    user: dict = Depends(current_user),
+    user: Optional[dict] = Depends(optional_current_user),
 ) -> dict:
     value = usage_date or Date.today()
     init_db()
     with connect() as connection:
-        usage = usage_for_date(connection, value, user["id"])
+        usage = usage_for_date(connection, value, user["id"] if user else None)
 
     return {"date": date_key(value), "usage": usage}
 
 
 @app.get("/usage/history")
-def read_usage_history(user: dict = Depends(current_user)) -> dict:
+def read_usage_history(user: Optional[dict] = Depends(optional_current_user)) -> dict:
     init_db()
     with connect() as connection:
-        rows = connection.execute(
-            """
-            SELECT usage_date, domain, minutes
-            FROM user_daily_usage
-            WHERE user_id = ?
-            ORDER BY usage_date ASC, minutes DESC
-            """,
-            (user["id"],),
-        ).fetchall()
+        if user:
+            rows = connection.execute(
+                """
+                SELECT usage_date, domain, minutes
+                FROM user_daily_usage
+                WHERE user_id = ?
+                ORDER BY usage_date ASC, minutes DESC
+                """,
+                (user["id"],),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT date AS usage_date, domain, minutes
+                FROM daily_usage
+                ORDER BY date ASC, minutes DESC
+                """
+            ).fetchall()
 
     history: dict[str, dict[str, float]] = {}
     for row in rows:
         history.setdefault(row["usage_date"], {})[row["domain"]] = round(float(row["minutes"]), 2)
 
     return {"history": history}
+
+
+@app.post("/sessions")
+def save_local_sessions(
+    payload: dict = Body(...),
+    database: SqlAlchemySession = Depends(get_db),
+) -> dict:
+    init_db()
+    raw_sessions = payload.get("sessions") if isinstance(payload, dict) and "sessions" in payload else [payload]
+    stored: list[BrowsingSession] = []
+
+    for raw_session in raw_sessions or []:
+        session_payload = LocalSessionPayload(**raw_session)
+        started_at, ended_at = local_session_times(session_payload)
+        domain = normalize_domain_name(session_payload.domain)
+        session = BrowsingSession(
+            id=session_payload.id or str(uuid4()),
+            domain=domain,
+            start_time=started_at,
+            end_time=ended_at,
+            duration_minutes=local_session_duration(session_payload, started_at, ended_at),
+        )
+        stored.append(database.merge(session))
+
+    database.commit()
+    return {"stored": len(stored), "sessions": [local_session_record(session) for session in stored]}
+
+
+@app.get("/sessions")
+def read_local_sessions(
+    domain: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    database: SqlAlchemySession = Depends(get_db),
+) -> dict:
+    init_db()
+    query = database.query(BrowsingSession)
+    if domain:
+        query = query.filter(BrowsingSession.domain == normalize_domain_name(domain))
+    rows = query.order_by(BrowsingSession.end_time.desc()).limit(limit).all()
+    return {"sessions": [local_session_record(session) for session in rows]}
+
+
+@app.get("/categories")
+def read_local_categories(database: SqlAlchemySession = Depends(get_db)) -> dict:
+    init_db()
+    rows = database.query(Category).order_by(Category.domain.asc()).all()
+    return {"categories": [local_category_record(category) for category in rows]}
+
+
+@app.put("/categories/{domain}")
+def update_local_category(
+    domain: str,
+    payload: CategoryUpdatePayload,
+    database: SqlAlchemySession = Depends(get_db),
+) -> dict:
+    init_db()
+    category = Category(domain=normalize_domain_name(domain), category=normalize_productivity(payload.category))
+    database.merge(category)
+    database.commit()
+    return {"category": local_category_record(category)}
 
 
 @app.get("/task-profiles")
@@ -2054,10 +2232,10 @@ def read_weekly_report(
 
 
 @app.get("/usage/{usage_date}")
-def read_usage(usage_date: Date, user: dict = Depends(current_user)) -> dict:
+def read_usage(usage_date: Date, user: Optional[dict] = Depends(optional_current_user)) -> dict:
     init_db()
     with connect() as connection:
-        usage = usage_for_date(connection, usage_date, user["id"])
+        usage = usage_for_date(connection, usage_date, user["id"] if user else None)
 
     if not usage:
         raise HTTPException(status_code=404, detail="No usage found for that date")
@@ -2069,11 +2247,11 @@ def read_usage(usage_date: Date, user: dict = Depends(current_user)) -> dict:
 def read_insights(
     usage_date: Optional[Date] = Query(default=None, alias="date"),
     weeks: int = Query(default=BASELINE_WEEKDAY_OCCURRENCES, ge=1, le=12),
-    user: dict = Depends(current_user),
+    user: Optional[dict] = Depends(optional_current_user),
 ) -> dict:
     value = usage_date or Date.today()
     init_db()
 
     with connect() as connection:
-        return compute_insights(connection, value, weeks, user["id"])
+        return compute_insights(connection, value, weeks, user["id"] if user else None)
 

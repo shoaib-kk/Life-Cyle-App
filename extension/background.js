@@ -1,6 +1,6 @@
 ﻿const DEFAULT_BACKEND_URL = "http://127.0.0.1:8000";
 const AUTH_CALLBACK_PATH = "/extension-callback";
-const STORAGE_SCHEMA_VERSION = 1;
+const STORAGE_SCHEMA_VERSION = 2;
 const BASELINE_WEEKDAY_OCCURRENCES = 8;
 const FULL_DAY_MINUTES = 24 * 60;
 const ABOVE_BASELINE_THRESHOLD = 0.3;
@@ -15,6 +15,8 @@ const DAILY_HISTORY_RETENTION_DAYS = 70;
 const SESSION_GAP_THRESHOLD_MS = 5 * 60 * 1000;
 const BACKEND_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1000;
 const BACKEND_SYNC_ERROR_LOG_INTERVAL_MS = 15 * 60 * 1000;
+const BACKEND_SYNC_ALARM = "lifecycle-backend-sync";
+const DAILY_RESET_SYNC_ALARM = "lifecycle-daily-reset-sync";
 const OVERLAY_COOLDOWN_MS = 30 * 60 * 1000;
 const OVERLAY_SESSION_RATIO = 1.3;
 const SESSION_END_REASONS = new Set([
@@ -118,6 +120,18 @@ async function setSettings(settings) {
   await chrome.storage.local.set({ settings });
 }
 
+async function scheduleDailyResetSync() {
+  const settings = await getSettings();
+  chrome.alarms.create(DAILY_RESET_SYNC_ALARM, {
+    when: nextLocalReset(Date.now(), settings.dailyResetHour) + 1000
+  });
+}
+
+async function ensureSyncAlarms() {
+  chrome.alarms.create(BACKEND_SYNC_ALARM, { periodInMinutes: 5 });
+  await scheduleDailyResetSync();
+}
+
 async function getBackendUrl() {
   const { backendUrl = DEFAULT_BACKEND_URL } = await chrome.storage.local.get({
     backendUrl: DEFAULT_BACKEND_URL
@@ -130,10 +144,14 @@ function normalizeSessionShape(session) {
     return session;
   }
 
+  const id = session.id || session.uuid || (crypto.randomUUID ? crypto.randomUUID() : `session-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
   return {
     ...session,
+    id,
     startedAt: session.startedAt || session.startTime,
-    endedAt: session.endedAt || session.endTime
+    endedAt: session.endedAt || session.endTime,
+    synced: Boolean(session.synced)
   };
 }
 
@@ -958,6 +976,14 @@ async function authHeaders() {
   };
 }
 
+async function backendJsonHeaders() {
+  const token = await getAuthToken();
+  return {
+    "Content-Type": "application/json",
+    ...(token ? { "Authorization": `Bearer ${token}` } : {})
+  };
+}
+
 async function clearAuthState(authError = "") {
   await chrome.storage.local.remove(["authToken", "authEmail", "authUserId"]);
   await chrome.storage.local.set({ authError });
@@ -984,6 +1010,30 @@ function pruneDailyHistory(dailyUsage, trackedDays, timestamp = Date.now(), rese
 async function getSessions() {
   const { sessions = [] } = await chrome.storage.local.get({ sessions: [] });
   return Array.isArray(sessions) ? sessions : [];
+}
+
+function isSessionSyncable(session) {
+  return Boolean(
+    session?.id &&
+      session?.domain &&
+      (session.startedAt || session.startTime) &&
+      (session.endedAt || session.endTime) &&
+      Number(session.durationMinutes || 0) > 0
+  );
+}
+
+async function markSessionsSynced(sessionIds) {
+  if (!sessionIds.length) {
+    return;
+  }
+
+  const idSet = new Set(sessionIds);
+  const sessions = await getSessions();
+  await chrome.storage.local.set({
+    sessions: sessions.map((session) => (
+      idSet.has(session?.id) ? { ...session, synced: true } : session
+    ))
+  });
 }
 
 function pruneSessionHistory(sessions) {
@@ -1021,15 +1071,18 @@ async function saveCompletedSession(activeSession, endedAt, reasonEnded = "tab_c
   const safeReason = SESSION_END_REASONS.has(reasonEnded) ? reasonEnded : "tab_change";
   const taskSession = await getTaskSession();
   const { domainCategories } = await getAppState();
+  const id = crypto.randomUUID ? crypto.randomUUID() : `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const sessionSummary = {
-    externalId: `${activeSession.domain}:${toIsoString(startedAt)}:${toIsoString(endedAt)}:${safeReason}`,
+    id,
+    externalId: id,
     domain: activeSession.domain,
     category: categoryForDomain(activeSession.domain, domainCategories),
     profileId: taskSession?.profileId || null,
     startedAt: toIsoString(startedAt),
     endedAt: toIsoString(endedAt),
     durationMinutes,
-    reasonEnded: safeReason
+    reasonEnded: safeReason,
+    synced: false
   };
   sessions.push(sessionSummary);
 
@@ -2012,6 +2065,7 @@ async function buildSummary() {
     currentDomain,
     trackingPaused,
     excludedDomains,
+    domainCategories,
     currentSiteExcluded: isExcludedDomain(currentDomain, excludedDomains),
     domainCategory: categoryForDomain(domain, domainCategories),
     currentDomainCategory: categoryForDomain(currentDomain, domainCategories),
@@ -2355,56 +2409,26 @@ async function updateOverlay(tabId, domain, domainMins, averageMinutes, sessionM
 }
 
 async function syncUsageSessionToBackend(sessionSummary) {
-  const headers = await authHeaders();
-
-  if (!headers || !sessionSummary?.domain) {
+  if (!sessionSummary?.domain) {
     return;
   }
 
-  try {
-    const backendUrl = await getBackendUrl();
-    const response = await fetch(`${backendUrl}/usage-sessions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        externalId: sessionSummary.externalId,
-        domain: sessionSummary.domain,
-        category: sessionSummary.category,
-        profileId: sessionSummary.profileId,
-        startedAt: sessionSummary.startedAt,
-        endedAt: sessionSummary.endedAt,
-        durationMinutes: sessionSummary.durationMinutes,
-        reasonEnded: sessionSummary.reasonEnded,
-        source: "extension"
-      })
-    });
-
-    if (response.status === 401) {
-      await clearAuthState("Session expired. Please sign in again.");
-    }
-  } catch (_error) {
-    // Session-level sync is best-effort; daily aggregate sync still runs.
-  }
+  await syncTodayToBackend({ force: true });
 }
 
 async function syncDomainCategoryToBackend(domain, category, profileId = null) {
-  const headers = await authHeaders();
-
-  if (!headers || !domain) {
+  if (!domain) {
     return;
   }
 
   try {
     const backendUrl = await getBackendUrl();
-    const response = await fetch(`${backendUrl}/domain-categories`, {
-      method: "POST",
+    const headers = await backendJsonHeaders();
+    const response = await fetch(`${backendUrl}/categories/${encodeURIComponent(domain)}`, {
+      method: "PUT",
       headers,
       body: JSON.stringify({
-        domain,
-        category,
-        productivity: category,
-        profileId,
-        source: "extension"
+        category
       })
     });
 
@@ -2419,58 +2443,82 @@ async function syncDomainCategoryToBackend(domain, category, profileId = null) {
 async function syncTodayToBackend(options = {}) {
   const now = Date.now();
   const force = Boolean(options.force);
-  const headers = await authHeaders();
-
-  if (!headers) {
-    return;
-  }
+  const headers = await backendJsonHeaders();
 
   if (!force && now - lastBackendSyncAt < BACKEND_SYNC_MIN_INTERVAL_MS) {
     return;
   }
 
   const settings = await getSettings();
-  const dateKey = localDateKey(now, settings.dailyResetHour);
+  const dateKey = options.dateKey || localDateKey(now, settings.dailyResetHour);
   const { dailyUsage, trackedDays } = await getDailyUsage();
   const usage = dailyUsage[dateKey] || {};
   const backendUrl = await getBackendUrl();
+  const sessions = await getSessions();
+  const unsyncedSessions = sessions.filter((session) => !session?.synced && isSessionSyncable(session));
 
-  if (!trackedDays[dateKey]) {
+  if (!trackedDays[dateKey] && unsyncedSessions.length === 0) {
     return;
   }
 
   const signature = JSON.stringify({ date: dateKey, usage });
 
-  if (!force && signature === lastBackendSyncSignature) {
+  if (!force && signature === lastBackendSyncSignature && unsyncedSessions.length === 0) {
     lastBackendSyncAt = now;
     return;
   }
 
   try {
-    const response = await fetch(`${backendUrl}/usage`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ date: dateKey, usage, tracked: true })
-    });
+    if (trackedDays[dateKey]) {
+      const response = await fetch(`${backendUrl}/usage`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ date: dateKey, usage, tracked: true })
+      });
 
-    if (response.status === 401) {
-      await clearAuthState("Session expired. Please sign in again.");
-      return;
+      if (response.status === 401) {
+        await clearAuthState("Session expired. Please sign in again.");
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(`Backend usage sync failed with ${response.status}`);
+      }
+
+      lastBackendSyncSignature = signature;
     }
 
-    if (!response.ok) {
-      throw new Error(`Backend sync failed with ${response.status}`);
+    if (unsyncedSessions.length > 0) {
+      const response = await fetch(`${backendUrl}/sessions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          sessions: unsyncedSessions.map((session) => ({
+            id: session.id,
+            domain: session.domain,
+            startedAt: session.startedAt || session.startTime,
+            endedAt: session.endedAt || session.endTime,
+            durationMinutes: Number(session.durationMinutes || 0)
+          }))
+        })
+      });
+
+      if (response.status === 401) {
+        await clearAuthState("Session expired. Please sign in again.");
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(`Backend session sync failed with ${response.status}`);
+      }
+
+      await markSessionsSynced(unsyncedSessions.map((session) => session.id));
     }
 
     lastBackendSyncAt = now;
-    lastBackendSyncSignature = signature;
   } catch (_error) {
     lastBackendSyncAt = now;
-
-    if (now - lastBackendSyncErrorLogAt >= BACKEND_SYNC_ERROR_LOG_INTERVAL_MS) {
-      lastBackendSyncErrorLogAt = now;
-      console.warn("LifeCycle backend sync failed; local tracking remains active");
-    }
+    lastBackendSyncErrorLogAt = now;
   }
 }
 
@@ -2982,6 +3030,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create("lifecycle-checkpoint", { periodInMinutes: 1 });
   chrome.alarms.create("lifecycle-suggest-profile", { periodInMinutes: 5 });
   enqueue(async () => {
+    await ensureSyncAlarms();
     await migrateStorage();
     await pullFromBackend();
     await pullTaskProfilesFromBackend();
@@ -2995,6 +3044,7 @@ chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create("lifecycle-checkpoint", { periodInMinutes: 1 });
   chrome.alarms.create("lifecycle-suggest-profile", { periodInMinutes: 5 });
   enqueue(async () => {
+    await ensureSyncAlarms();
     await migrateStorage();
     await pullFromBackend();
     await pullTaskProfilesFromBackend();
@@ -3017,6 +3067,16 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     enqueue(refreshActiveContext);
   } else if (alarm.name === "lifecycle-suggest-profile") {
     enqueue(maybeSuggestProfile);
+  } else if (alarm.name === BACKEND_SYNC_ALARM) {
+    enqueue(() => syncTodayToBackend({ force: true }));
+  } else if (alarm.name === DAILY_RESET_SYNC_ALARM) {
+    enqueue(async () => {
+      const settings = await getSettings();
+      const previousDateKey = localDateKey(Date.now() - 60000, settings.dailyResetHour);
+      await syncTodayToBackend({ force: true, dateKey: previousDateKey });
+      await syncTodayToBackend({ force: true });
+      await scheduleDailyResetSync();
+    });
   }
 });
 
@@ -3136,6 +3196,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       await setSettings({
         dailyResetHour: message.settings?.dailyResetHour === 3 ? 3 : 0
       });
+      await scheduleDailyResetSync();
       await checkpointActiveSession(timestamp);
       await refreshActiveContext();
       return buildSummary();
